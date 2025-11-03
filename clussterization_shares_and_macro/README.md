@@ -15,10 +15,8 @@
 - (опционально) PyTorch с CUDA — по инструкции на pytorch.org
 
 ## Выходные файлы AE
-- grid_results.csv — сводка по всей сетке
-- cluster_grid_best_assignments.csv — компания → кластер (лучший вариант)
-- clusters_grid_best_report.pdf — отчёт (PCA, ряды по кластерам, таблица)
-- cluster_grid_best_table.html — интерактивная таблица
+- cluster_fullstart_assignments.csv — распределение по класстерам
+- clusters_fullstart_report.pdf - pdf с графиками всех класстеров
 - ячяйка после автонкодера содержит в себе код для запуска интерактивных графиков, где можно посмотреть все класстеры детально
 
 ## Выходные файлы после поиска корреляций

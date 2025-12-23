@@ -271,7 +271,7 @@ nvidia-smi
 ## 10) Запуск
 
 ```bash
-python train_monthly_walkforward.py
+python xgboost_and_catboost.py.py
 ```
 
 ---

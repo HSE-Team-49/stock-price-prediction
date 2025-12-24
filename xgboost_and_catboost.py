@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,18 +14,18 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import xgboost as xgb
 from catboost import CatBoostRegressor, Pool
 
+
+
 DATA_DIR = "data"
 ALL_CSV = os.path.join(DATA_DIR, "prices_all.csv")
 
 PRICE_COL_PREF = "auto"
 
+# Тестируем целевые месяцы (target_month) 2024
 TEST_YEAR = 2024
-TRAIN_END = pd.Timestamp(f"{TEST_YEAR-1}-12-31")
 
-# Optuna
-N_TRIALS_XGB = 40
-N_TRIALS_CAT = 40
 RANDOM_STATE = 13
+np.random.seed(RANDOM_STATE)
 
 # Фичи
 LAGS = [1, 2, 3, 6, 9, 12]
@@ -32,10 +33,33 @@ ROLL_WINDOWS = [3, 6, 12]
 ATR_WINDOWS = [6, 12]
 RSI_PERIODS = [6, 12]
 
+# Модель: "xgb" или "cat"
+MODEL_KIND = "xgb"
+
+# GPU/CPU
+USE_GPU_XGB = True     
+USE_GPU_CAT = True     
+
+# Optuna
+N_TRIALS_XGB = 25
+N_TRIALS_CAT = 25
+HOLDOUT_MONTHS = 12
+
+OUT_DIR = "forecasts"
+PARAMS_DIR = os.path.join(OUT_DIR, "optuna_params")
+os.makedirs(PARAMS_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Логи
+LOG_EVERY_TICKER = 20
+LOG_EVERY_MONTH = 4
+
+
 
 def load_prices() -> pd.DataFrame:
     if not os.path.exists(ALL_CSV):
         raise SystemExit(f"Не найден файл {ALL_CSV}")
+
     df = pd.read_csv(ALL_CSV)
 
     ren = {}
@@ -69,26 +93,42 @@ def filter_tickers_starting_at_global_min(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["Ticker"].isin(keep)].copy()
 
 
+def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "R2": float(r2_score(y_true, y_pred)),
+    }
+
+
+def _params_path(model_kind: str, ticker: str) -> str:
+    safe = ticker.replace("/", "_").replace("\\", "_").replace(":", "_")
+    return os.path.join(PARAMS_DIR, f"{model_kind}_params_{safe}.json")
+
+
+def load_cached_params(model_kind: str, ticker: str) -> Optional[Dict]:
+    path = _params_path(model_kind, ticker)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def save_cached_params(model_kind: str, ticker: str, params: Dict) -> None:
+    path = _params_path(model_kind, ticker)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False, indent=2)
+
+
 
 def compute_atr(hi: pd.Series, lo: pd.Series, close: pd.Series, ws: int) -> pd.Series:
-    """
-    ATR (Wilder).
-    TR_t = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
-    ATR = EMA(TR, alpha=1/ws) (Wilder smoothing)
-    """
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [hi - lo, (hi - prev_close).abs(), (lo - prev_close).abs()],
-        axis=1
-    ).max(axis=1)
+    tr = pd.concat([hi - lo, (hi - prev_close).abs(), (lo - prev_close).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1.0 / ws, adjust=False).mean()
     return atr
 
 
 def compute_rsi(ret: pd.Series, period: int) -> pd.Series:
-    """
-    RSI (Wilder) на базе месячных лог-доходностей.
-    """
     delta = ret.copy()
     gain = (delta.clip(lower=0)).ewm(alpha=1.0 / period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / period, adjust=False).mean()
@@ -129,27 +169,23 @@ def make_monthly_ohlcv(df: pd.DataFrame, price_col: str) -> Dict[str, pd.DataFra
 
 
 def make_market_factor(rets: pd.DataFrame) -> pd.Series:
-    """Рыночный фактор: equal-weight средняя месячная доходность по тикерам."""
     return rets.mean(axis=1)
 
 
 def month_cyc_features(index: pd.DatetimeIndex) -> pd.DataFrame:
     m = index.month
     return pd.DataFrame(
-        {
-            "month_sin": np.sin(2 * np.pi * m / 12.0),
-            "month_cos": np.cos(2 * np.pi * m / 12.0),
-        },
+        {"month_sin": np.sin(2 * np.pi * m / 12.0),
+         "month_cos": np.cos(2 * np.pi * m / 12.0)},
         index=index,
     )
 
 
 def make_monthly_panel(df: pd.DataFrame, price_col: str) -> pd.DataFrame:
     """
-    1) Дневные OHLCV -> месячные OHLCV
-    2) Лог-цены -> лог-доходности ret
-    3) Фичи: лаги, rolling, ATR, RSI, объём, рыночный фактор, календарные sin/cos
-    4) target_next = ret.shift(-1)
+    date = feature_month (месяц t)
+    target_next = ret(t+1)
+    target_month = t+1 (целевой месяц, который мы оцениваем)
     """
     M = make_monthly_ohlcv(df, price_col)
 
@@ -165,108 +201,104 @@ def make_monthly_panel(df: pd.DataFrame, price_col: str) -> pd.DataFrame:
     mkt = make_market_factor(rets)
     cal = month_cyc_features(rets.index)
 
-    # ATR/RSI матрицы на тикеры
     atr_map = {W: pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float) for W in ATR_WINDOWS}
     rsi_map = {P: pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float) for P in RSI_PERIODS}
 
     if (hi is not None) and (lo is not None) and (close is not None):
-        for t in rets.columns:
-            h = hi[t].reindex(rets.index)
-            l = lo[t].reindex(rets.index)
-            c = close[t].reindex(rets.index)
+        for tkr in rets.columns:
+            h = hi[tkr].reindex(rets.index)
+            l = lo[tkr].reindex(rets.index)
+            c = close[tkr].reindex(rets.index)
             for W in ATR_WINDOWS:
-                atr_map[W][t] = compute_atr(h, l, c, W)
+                atr_map[W][tkr] = compute_atr(h, l, c, W)
             for P in RSI_PERIODS:
-                rsi_map[P][t] = compute_rsi(rets[t], P)
+                rsi_map[P][tkr] = compute_rsi(rets[tkr], P)
 
-    # объёмы
     dlnv = None
     if vol is not None:
         lnv = np.log(vol.replace(0, np.nan))
         dlnv = lnv.diff()
 
     rows = []
-    for t in rets.columns.tolist():
-        s = rets[t].copy()
+    for tkr in rets.columns.tolist():
+        s = rets[tkr].copy()
+        feat = pd.DataFrame({"date": s.index, "Ticker": tkr, "ret": s.values}).set_index("date")
 
-        feat = pd.DataFrame({"date": s.index, "Ticker": t, "ret": s.values}).set_index("date")
-
-        # лаги
         for L in LAGS:
             feat[f"ret_lag{L}"] = feat["ret"].shift(L)
 
-        # rolling по ретам
         for W in ROLL_WINDOWS:
             feat[f"ret_roll_mean_{W}"] = feat["ret"].rolling(W).mean()
             feat[f"ret_roll_std_{W}"] = feat["ret"].rolling(W).std()
             feat[f"ret_mom_{W}"] = feat["ret"].rolling(W).sum()
 
-        # ATR/RSI
         for W in ATR_WINDOWS:
-            feat[f"atr_{W}"] = atr_map[W][t]
+            feat[f"atr_{W}"] = atr_map[W][tkr]
         for P in RSI_PERIODS:
-            feat[f"rsi_{P}"] = rsi_map[P][t]
+            feat[f"rsi_{P}"] = rsi_map[P][tkr]
 
-        # объёмы
         if dlnv is not None:
-            feat["vol_dln_1"] = dlnv[t]
+            feat["vol_dln_1"] = dlnv[tkr]
             for W in ROLL_WINDOWS:
-                feat[f"vol_roll_std_{W}"] = dlnv[t].rolling(W).std()
+                feat[f"vol_roll_std_{W}"] = dlnv[tkr].rolling(W).std()
 
-        # рыночный фактор + лаги
         feat["mkt_ret"] = mkt.reindex(feat.index)
         for L in [1, 3, 6, 12]:
             feat[f"mkt_ret_lag{L}"] = feat["mkt_ret"].shift(L)
 
-        # календарные
         feat = feat.join(cal)
 
-        # таргет
         feat["target_next"] = feat["ret"].shift(-1)
 
         feat = feat.dropna().reset_index()
         rows.append(feat)
 
     panel = pd.concat(rows, ignore_index=True)
+    panel["target_month"] = (panel["date"] + pd.offsets.MonthEnd(1)).dt.to_period("M")
 
-    cols = ["date", "Ticker", "target_next"] + [
-        c for c in panel.columns if c not in {"date", "Ticker", "ret", "target_next"}
-    ]
-    panel = panel[cols].sort_values(["date", "Ticker"]).reset_index(drop=True)
+    feat_cols = [c for c in panel.columns if c not in {"date", "Ticker", "ret", "target_next", "target_month"}]
+
+    panel = panel[["date", "target_month", "Ticker", "target_next"] + feat_cols] \
+        .sort_values(["Ticker", "target_month"]) \
+        .reset_index(drop=True)
+
     return panel
 
 
-def metrics(y_true, y_pred) -> Dict[str, float]:
-    return {
-        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "R2": float(r2_score(y_true, y_pred)),
-    }
 
+def split_train_holdout_by_target_month(df_train: pd.DataFrame, holdout_months: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    df_train содержит только target_month < TEST_YEAR.
+    Делим по последним holdout_months целевых месяцев.
+    """
+    if df_train.empty:
+        raise ValueError("df_train empty")
 
+    last_tm = df_train["target_month"].max()
+    cutoff_tm = last_tm - holdout_months  # Period arithmetic
 
-def _split_last_12m_holdout(train_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    last_train_date = train_df["date"].max()
-    cutoff = last_train_date - pd.offsets.MonthEnd(12)
-    tr = train_df[train_df["date"] <= cutoff].copy()
-    va = train_df[train_df["date"] > cutoff].copy()
+    tr = df_train[df_train["target_month"] <= cutoff_tm].copy()
+    va = df_train[df_train["target_month"] > cutoff_tm].copy()
+
     if tr.empty or va.empty:
-        raise SystemExit("Слишком мало данных в train для hold-out на последние 12 месяцев.")
+        raise SystemExit("Слишком мало месяцев в train для hold-out. Уменьши HOLDOUT_MONTHS или проверь данные.")
     return tr, va
 
 
-def optuna_xgb(train_df: pd.DataFrame, feat_cols: List[str]) -> Dict:
-    tr, va = _split_last_12m_holdout(train_df)
+
+def optuna_xgb_one_ticker(df_train: pd.DataFrame, feat_cols: List[str]) -> Dict:
+    tr, va = split_train_holdout_by_target_month(df_train, HOLDOUT_MONTHS)
 
     dtr = xgb.DMatrix(tr[feat_cols], label=tr["target_next"])
     dva = xgb.DMatrix(va[feat_cols], label=va["target_next"])
 
-    def objective(trial: optuna.Trial):
+    def objective(trial: optuna.Trial) -> float:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "device": "cuda",
             "tree_method": "hist",
+            "device": "cuda" if USE_GPU_XGB else "cpu",
+
             "max_depth": trial.suggest_int("max_depth", 3, 10),
             "min_child_weight": trial.suggest_float("min_child_weight", 1e-3, 10.0, log=True),
             "subsample": trial.suggest_float("subsample", 0.5, 1.0),
@@ -277,242 +309,164 @@ def optuna_xgb(train_df: pd.DataFrame, feat_cols: List[str]) -> Dict:
             "alpha": trial.suggest_float("alpha", 1e-3, 10.0, log=True),
             "max_bin": trial.suggest_int("max_bin", 64, 512),
         }
-        rounds = trial.suggest_int("num_boost_round", 300, 1500)
+        rounds = trial.suggest_int("num_boost_round", 200, 1200)
+
         bst = xgb.train(params, dtr, num_boost_round=rounds, evals=[(dva, "valid")], verbose_eval=False)
         pred = bst.predict(dva)
-        return np.sqrt(mean_squared_error(va["target_next"], pred))
+        return float(np.sqrt(mean_squared_error(va["target_next"].values, pred)))
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
-    study.optimize(objective, n_trials=N_TRIALS_XGB, show_progress_bar=True)
+    study.optimize(objective, n_trials=N_TRIALS_XGB, show_progress_bar=False)
 
-    best_params = study.best_trial.params
-    return {
+    best = study.best_trial.params
+    cfg = {
         "params": {
             "objective": "reg:squarederror",
             "eval_metric": "rmse",
-            "device": "cuda",
             "tree_method": "hist",
-            **{k: v for k, v in best_params.items() if k != "num_boost_round"},
+            "device": "cuda" if USE_GPU_XGB else "cpu",
+            **{k: v for k, v in best.items() if k != "num_boost_round"},
         },
-        "num_boost_round": int(best_params["num_boost_round"]),
+        "num_boost_round": int(best["num_boost_round"]),
+        "best_rmse_holdout": float(study.best_value),
     }
+    return cfg
 
 
-def optuna_cat(train_df: pd.DataFrame, feat_cols: List[str]) -> Dict:
-    tr, va = _split_last_12m_holdout(train_df)
+def optuna_cat_one_ticker(df_train: pd.DataFrame, feat_cols: List[str]) -> Dict:
+    tr, va = split_train_holdout_by_target_month(df_train, HOLDOUT_MONTHS)
 
     pool_tr = Pool(tr[feat_cols], tr["target_next"])
     pool_va = Pool(va[feat_cols], va["target_next"])
 
-    def objective(trial: optuna.Trial):
+    def objective(trial: optuna.Trial) -> float:
         params = {
             "loss_function": "RMSE",
-            "task_type": "GPU",
-            "devices": "0",
+            "random_seed": RANDOM_STATE,
+            "allow_writing_files": False,
+            "logging_level": "Silent",
+
+            "task_type": "GPU" if USE_GPU_CAT else "CPU",
+            "devices": "0" if USE_GPU_CAT else None,
+
             "depth": trial.suggest_int("depth", 4, 10),
             "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10.0, log=True),
             "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 10.0),
             "random_strength": trial.suggest_float("random_strength", 0.0, 10.0),
-            "grow_policy": "SymmetricTree",
             "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bayesian", "Poisson"]),
             "border_count": trial.suggest_int("border_count", 64, 255),
-            "allow_writing_files": False,
-            "logging_level": "Silent",
-            "gpu_ram_part": trial.suggest_float("gpu_ram_part", 0.7, 0.98),
+
             "od_type": "Iter",
             "od_wait": trial.suggest_int("od_wait", 50, 200),
         }
-        iterations = trial.suggest_int("iterations", 700, 2500)
+        iterations = trial.suggest_int("iterations", 500, 2000)
 
-        model = CatBoostRegressor(**params, iterations=iterations, random_seed=RANDOM_STATE)
-        model.fit(pool_tr, eval_set=pool_va, use_best_model=True)
+        if params.get("devices", None) is None:
+            params.pop("devices", None)
 
+        model = CatBoostRegressor(**params, iterations=iterations)
+        model.fit(pool_tr, eval_set=pool_va, use_best_model=True, verbose=False)
         pred = model.predict(pool_va)
-        return np.sqrt(mean_squared_error(va["target_next"], pred))
+        return float(np.sqrt(mean_squared_error(va["target_next"].values, pred)))
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
-    study.optimize(objective, n_trials=N_TRIALS_CAT, timeout=3600, show_progress_bar=True)
+    study.optimize(objective, n_trials=N_TRIALS_CAT, show_progress_bar=False)
 
     best = study.best_trial.params
-    best_fixed = {
-        "loss_function": "RMSE",
-        "task_type": "GPU",
-        "devices": "0",
-        "allow_writing_files": False,
-        "logging_level": "Silent",
-        "grow_policy": "SymmetricTree",
-        "bootstrap_type": best["bootstrap_type"],
-        "depth": best["depth"],
-        "learning_rate": best["learning_rate"],
-        "l2_leaf_reg": best["l2_leaf_reg"],
-        "bagging_temperature": best["bagging_temperature"],
-        "random_strength": best["random_strength"],
-        "border_count": best["border_count"],
-        "gpu_ram_part": best["gpu_ram_part"],
-        "od_type": "Iter",
-        "od_wait": best["od_wait"],
+    cfg = {
+        "params": {
+            "loss_function": "RMSE",
+            "random_seed": RANDOM_STATE,
+            "allow_writing_files": False,
+            "logging_level": "Silent",
+            "task_type": "GPU" if USE_GPU_CAT else "CPU",
+            **{k: v for k, v in best.items() if k != "iterations"},
+        },
+        "iterations": int(best["iterations"]),
+        "best_rmse_holdout": float(study.best_value),
     }
-    return {"params": best_fixed, "iterations": int(best["iterations"])}
+    # если CPU — уберём devices
+    if not USE_GPU_CAT:
+        cfg["params"].pop("devices", None)
+    else:
+        cfg["params"]["devices"] = "0"
+    return cfg
 
 
-
-def walk_forward_xgb_expanding(panel_all: pd.DataFrame,
-                               feat_cols: List[str],
-                               xgb_params: Dict,
-                               num_boost_round: int,
-                               test_year: int) -> pd.DataFrame:
-    """
-    Expanding window retrain:
-    на месяце m:
-      - обучаем XGB с нуля на всех месяцах < m (накопленные с самого начала)
-      - предсказываем для месяца m
-      - затем добавляем месяц m в накопление
-    Сохраняем предсказания только для месяцев test_year.
-    """
-    panel_all = panel_all.sort_values(["date", "Ticker"]).reset_index(drop=True)
-    months = sorted(panel_all["date"].dt.to_period("M").unique())
+def walk_forward_xgb_ticker(df_t: pd.DataFrame, feat_cols: List[str], best_cfg: Dict) -> pd.DataFrame:
+    df_t = df_t.sort_values("target_month").reset_index(drop=True)
+    test_months = [m for m in df_t["target_month"].unique().tolist() if m.year == TEST_YEAR]
 
     preds = []
-    train_cum = []
+    tkr = df_t["Ticker"].iloc[0]
 
-    for m in months:
-        cur = panel_all[panel_all["date"].dt.to_period("M") == m]
-        if cur.empty:
+    for i, tm in enumerate(test_months, 1):
+        train_df = df_t[df_t["target_month"] < tm]
+        cur_df = df_t[df_t["target_month"] == tm]
+
+        if train_df.empty or cur_df.empty:
             continue
 
-        if len(train_cum) > 0:
-            train_df = pd.concat(train_cum, ignore_index=True)
-            dtr = xgb.DMatrix(train_df[feat_cols], label=train_df["target_next"])
-            model = xgb.train(xgb_params, dtr, num_boost_round=num_boost_round)
+        dtr = xgb.DMatrix(train_df[feat_cols], label=train_df["target_next"])
+        model = xgb.train(best_cfg["params"], dtr, num_boost_round=int(best_cfg["num_boost_round"]))
 
-            dcur = xgb.DMatrix(cur[feat_cols])
-            yhat = model.predict(dcur)
+        dcur = xgb.DMatrix(cur_df[feat_cols])
+        yhat = model.predict(dcur)
 
-            if int(m.year) == int(test_year):
-                preds.append(pd.DataFrame({
-                    "date": cur["date"].values,
-                    "Ticker": cur["Ticker"].values,
-                    "y_true": cur["target_next"].values,
-                    "y_pred": yhat,
-                    "phase": "pred_before_update"
-                }))
+        preds.append(pd.DataFrame({
+            "Ticker": tkr,
+            "target_month": cur_df["target_month"].astype(str).values,
+            "feature_month": cur_df["date"].dt.to_period("M").astype(str).values,
+            "y_true": cur_df["target_next"].values,
+            "y_pred": yhat,
+        }))
 
-        # "прошли месяц" -> добавили в накопление (веса изменятся на следующем шаге)
-        train_cum.append(cur)
+        if LOG_EVERY_MONTH and (i % LOG_EVERY_MONTH == 0):
+            m = metrics(cur_df["target_next"].values, yhat)
+            print(f"  [{tkr}] {tm}  RMSE={m['RMSE']:.4f} MAE={m['MAE']:.4f} R2={m['R2']:.4f}")
 
     return pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
 
 
-def walk_forward_cat_expanding(panel_all: pd.DataFrame,
-                               feat_cols: List[str],
-                               cat_cfg: Dict,
-                               test_year: int,
-                               holdout_months: int = 12,
-                               max_iters_wf: int = 1200,
-                               log_every: int = 1) -> pd.DataFrame:
-    """
-    Expanding window retrain для CatBoost (каждый месяц переобучаемся с нуля на 1..t-1),
-    но с ускорением:
-      - hold-out последние `holdout_months` месяцев внутри накопленного train
-      - early stopping через use_best_model + od_type/od_wait
-      - потолок iterations для walk-forward: max_iters_wf
-
-    Прозрачный лог:
-      - месяц шага
-      - месяцев в train (уникальных)
-      - строк в train
-      - использовано итераций (model.tree_count_)
-      - время шага (сек)
-    """
-    import time
-
-    panel_all = panel_all.sort_values(["date", "Ticker"]).reset_index(drop=True)
-    months = sorted(panel_all["date"].dt.to_period("M").unique())
+def walk_forward_cat_ticker(df_t: pd.DataFrame, feat_cols: List[str], best_cfg: Dict) -> pd.DataFrame:
+    df_t = df_t.sort_values("target_month").reset_index(drop=True)
+    test_months = [m for m in df_t["target_month"].unique().tolist() if m.year == TEST_YEAR]
 
     preds = []
-    train_cum = []
+    tkr = df_t["Ticker"].iloc[0]
 
-    base_params = dict(cat_cfg["params"])
-    iterations = int(min(cat_cfg["iterations"], max_iters_wf))
+    base_params = dict(best_cfg["params"])
+    iterations = int(best_cfg["iterations"])
 
-    base_params.setdefault("od_type", "Iter")
-    base_params.setdefault("od_wait", 100)
-    base_params.setdefault("allow_writing_files", False)
-    base_params.setdefault("logging_level", "Silent")
-    base_params.setdefault("task_type", "GPU")
-    base_params.setdefault("devices", "0")
+    for i, tm in enumerate(test_months, 1):
+        train_df = df_t[df_t["target_month"] < tm]
+        cur_df = df_t[df_t["target_month"] == tm]
 
-    for step_i, m in enumerate(months, 1):
-        cur = panel_all[panel_all["date"].dt.to_period("M") == m]
-        if cur.empty:
+        if train_df.empty or cur_df.empty:
             continue
 
-        # учимся на 1..t-1
-        if len(train_cum) > 0:
-            train_df = pd.concat(train_cum, ignore_index=True)
-            n_months = train_df["date"].dt.to_period("M").nunique()
-            n_rows = len(train_df)
+        model = CatBoostRegressor(**base_params, iterations=iterations)
+        model.fit(train_df[feat_cols], train_df["target_next"], verbose=False)
 
-            t0 = time.perf_counter()
-            model = CatBoostRegressor(**base_params, iterations=iterations, random_seed=RANDOM_STATE)
+        yhat = model.predict(cur_df[feat_cols])
 
-            used_holdout = False
-            if n_months >= (holdout_months + 2):
-                used_holdout = True
-                last_date = train_df["date"].max()
-                cutoff = last_date - pd.offsets.MonthEnd(holdout_months)
+        preds.append(pd.DataFrame({
+            "Ticker": tkr,
+            "target_month": cur_df["target_month"].astype(str).values,
+            "feature_month": cur_df["date"].dt.to_period("M").astype(str).values,
+            "y_true": cur_df["target_next"].values,
+            "y_pred": yhat,
+        }))
 
-                tr = train_df[train_df["date"] <= cutoff]
-                va = train_df[train_df["date"] > cutoff]
-
-                if (len(tr) > 0) and (len(va) > 0):
-                    pool_tr = Pool(tr[feat_cols], tr["target_next"])
-                    pool_va = Pool(va[feat_cols], va["target_next"])
-                    model.fit(pool_tr, eval_set=pool_va, use_best_model=True, verbose=False)
-                else:
-                    used_holdout = False
-                    pool_all = Pool(train_df[feat_cols], train_df["target_next"])
-                    model.fit(pool_all, verbose=False)
-            else:
-                pool_all = Pool(train_df[feat_cols], train_df["target_next"])
-                model.fit(pool_all, verbose=False)
-
-            # predict
-            yhat = model.predict(cur[feat_cols])
-
-            # сохранить только test_year
-            if int(m.year) == int(test_year):
-                preds.append(pd.DataFrame({
-                    "date": cur["date"].values,
-                    "Ticker": cur["Ticker"].values,
-                    "y_true": cur["target_next"].values,
-                    "y_pred": yhat,
-                    "phase": "pred_before_update"
-                }))
-
-            dt = time.perf_counter() - t0
-            used_iters = getattr(model, "tree_count_", None)
-
-            if log_every and (step_i % log_every == 0):
-                holdout_tag = "holdout+ES" if used_holdout else "no-holdout"
-                iters_tag = f"{used_iters}" if used_iters is not None else "?"
-                print(
-                    f"[WF CAT] step={step_i:3d}/{len(months)} "
-                    f"month={m} train_months={n_months:3d} train_rows={n_rows:6d} "
-                    f"iters_used={iters_tag:>4s}/{iterations} "
-                    f"time={dt:6.2f}s mode={holdout_tag}"
-                )
-
-        # добавляем текущий месяц в историю
-        train_cum.append(cur)
+        if LOG_EVERY_MONTH and (i % LOG_EVERY_MONTH == 0):
+            m = metrics(cur_df["target_next"].values, yhat)
+            print(f"  [{tkr}] {tm}  RMSE={m['RMSE']:.4f} MAE={m['MAE']:.4f} R2={m['R2']:.4f}")
 
     return pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
-
 
 
 def main():
-    np.random.seed(RANDOM_STATE)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     print("[INFO] Загружаем данные…")
@@ -520,81 +474,103 @@ def main():
     price_col = pick_price_col(raw)
 
     raw = filter_tickers_starting_at_global_min(raw)
-    print(f"[INFO] Тикеров с началом в глобальной дате: {raw['Ticker'].nunique()}")
+    tickers = sorted(raw["Ticker"].unique().tolist())
+    print(f"[INFO] Тикеров с началом в глобальной дате: {len(tickers)}")
 
     print("[INFO] Формируем месячный панель и фичи…")
     panel = make_monthly_panel(raw, price_col)
 
-    # TRAIN = всё до 2024, TEST = 2024
-    train = panel[panel["date"] <= TRAIN_END].copy()
-    test = panel[panel["date"].dt.year == TEST_YEAR].copy()
-
-    feat_cols = [c for c in panel.columns if c not in {"date", "Ticker", "target_next"}]
-
-    print(f"[INFO] Train ≤ {TRAIN_END.date()}: rows={len(train)}")
-    print(f"[INFO] Test {TEST_YEAR}: rows={len(test)}")
+    feat_cols = [c for c in panel.columns if c not in {"date", "Ticker", "target_next", "target_month"}]
     print(f"[INFO] #Features = {len(feat_cols)}  пример: {feat_cols[:8]}")
+    print(f"[INFO] TEST_YEAR={TEST_YEAR}  HOLDOUT_MONTHS={HOLDOUT_MONTHS}")
+    print(f"[INFO] MODEL_KIND={MODEL_KIND}  N_TRIALS_XGB={N_TRIALS_XGB}  N_TRIALS_CAT={N_TRIALS_CAT}")
 
-    print("\n[INFO] Optuna → XGBoost (GPU) на train…")
-    best_xgb = optuna_xgb(train, feat_cols)
-    print("[INFO] Best XGB:", best_xgb)
+    all_preds = []
+    per_ticker_metrics = []
 
-    print("\n[INFO] Optuna → CatBoost (GPU) на train…")
-    best_cat = optuna_cat(train, feat_cols)
-    print("[INFO] Best CAT:", best_cat)
+    for idx, tkr in enumerate(tickers, 1):
+        df_t = panel[panel["Ticker"] == tkr].copy()
+        if df_t.empty:
+            continue
 
-    print(f"\n[INFO] Walk-forward expanding (XGB) → сохраняем предикты только за {TEST_YEAR}…")
-    xgb_preds = walk_forward_xgb_expanding(
-        panel_all=panel,
-        feat_cols=feat_cols,
-        xgb_params=best_xgb["params"],
-        num_boost_round=best_xgb["num_boost_round"],
-        test_year=TEST_YEAR
-    )
+        df_train = df_t[df_t["target_month"].dt.year < TEST_YEAR].copy()
+        if df_train.empty:
+            continue
 
-    print(f"[INFO] Walk-forward expanding (CAT) → сохраняем предикты только за {TEST_YEAR}…")
-    cat_preds = walk_forward_cat_expanding(
-    panel_all=panel,
-    feat_cols=feat_cols,
-    cat_cfg=best_cat,
-    test_year=TEST_YEAR,
-    holdout_months=12,
-    max_iters_wf=1200,
-    log_every=1      
-    )
+        if not (df_t["target_month"].dt.year == TEST_YEAR).any():
+            continue
 
+        if idx == 1 or (LOG_EVERY_TICKER and idx % LOG_EVERY_TICKER == 0):
+            print(f"\n[INFO] ({idx}/{len(tickers)}) Ticker={tkr}  train_rows={len(df_train)}  total_rows={len(df_t)}")
 
-    if xgb_preds.empty or cat_preds.empty:
-        raise SystemExit("Не получилось собрать предсказания (слишком мало месяцев/данных после dropna).")
+        cached = load_cached_params(MODEL_KIND, tkr)
+        if cached is not None:
+            best_cfg = cached
+        else:
+            if MODEL_KIND == "xgb":
+                best_cfg = optuna_xgb_one_ticker(df_train, feat_cols)
+            elif MODEL_KIND == "cat":
+                best_cfg = optuna_cat_one_ticker(df_train, feat_cols)
+            else:
+                raise SystemExit(f"Unknown MODEL_KIND={MODEL_KIND}")
 
-    xgb_test_m = metrics(xgb_preds["y_true"], xgb_preds["y_pred"])
-    cat_test_m = metrics(cat_preds["y_true"], cat_preds["y_pred"])
+            save_cached_params(MODEL_KIND, tkr, best_cfg)
 
-    print("\n[XGB] Test:", xgb_test_m)
-    print("[CAT] Test:", cat_test_m)
+        if MODEL_KIND == "xgb":
+            preds_t = walk_forward_xgb_ticker(df_t, feat_cols, best_cfg)
+        else:
+            preds_t = walk_forward_cat_ticker(df_t, feat_cols, best_cfg)
 
-    os.makedirs("forecasts", exist_ok=True)
+        if preds_t.empty:
+            continue
 
-    xgb_path = f"forecasts/xgb_monthly_preds_test_{TEST_YEAR}.csv"
-    cat_path = f"forecasts/cat_monthly_preds_test_{TEST_YEAR}.csv"
-    sum_path = f"forecasts/summary_metrics_test_{TEST_YEAR}.csv"
+        m = metrics(preds_t["y_true"].values, preds_t["y_pred"].values)
+        per_ticker_metrics.append({
+            "Ticker": tkr,
+            "n_test": int(len(preds_t)),
+            "RMSE": m["RMSE"],
+            "MAE": m["MAE"],
+            "R2": m["R2"],
+            "best_holdout_rmse": float(best_cfg.get("best_rmse_holdout", np.nan)),
+        })
 
-    xgb_preds.to_csv(xgb_path, index=False)
-    cat_preds.to_csv(cat_path, index=False)
+        all_preds.append(preds_t)
 
-    pd.DataFrame({
-        "model": ["XGB-Test", "CAT-Test"],
-        "RMSE": [xgb_test_m["RMSE"], cat_test_m["RMSE"]],
-        "MAE":  [xgb_test_m["MAE"],  cat_test_m["MAE"]],
-        "R2":   [xgb_test_m["R2"],   cat_test_m["R2"]],
-        "test_year": [TEST_YEAR, TEST_YEAR],
-        "train_end": [str(TRAIN_END.date()), str(TRAIN_END.date())],
-    }).to_csv(sum_path, index=False)
+    if not all_preds:
+        raise SystemExit("Не получилось собрать предсказания. Проверь данные/фичи/периоды.")
+
+    preds = pd.concat(all_preds, ignore_index=True)
+    metrics_df = pd.DataFrame(per_ticker_metrics).sort_values("RMSE").reset_index(drop=True)
+
+    overall = metrics(preds["y_true"].values, preds["y_pred"].values)
+    print("\n[INFO] Overall (pooled):", overall)
+    print("[INFO] Best tickers by RMSE:")
+    print(metrics_df.head(10).to_string(index=False))
+
+    # Save
+    preds_path = os.path.join(OUT_DIR, f"{MODEL_KIND}_per_ticker_optuna_walkforward_target_{TEST_YEAR}.csv")
+    metrics_path = os.path.join(OUT_DIR, f"{MODEL_KIND}_per_ticker_optuna_metrics_target_{TEST_YEAR}.csv")
+    summary_path = os.path.join(OUT_DIR, f"{MODEL_KIND}_optuna_summary_target_{TEST_YEAR}.csv")
+
+    preds.to_csv(preds_path, index=False)
+    metrics_df.to_csv(metrics_path, index=False)
+    pd.DataFrame([{
+        "model": MODEL_KIND,
+        "test_year": TEST_YEAR,
+        "RMSE": overall["RMSE"],
+        "MAE": overall["MAE"],
+        "R2": overall["R2"],
+        "n_rows": int(len(preds)),
+        "n_tickers": int(preds["Ticker"].nunique()),
+        "holdout_months": HOLDOUT_MONTHS,
+        "n_trials": N_TRIALS_XGB if MODEL_KIND == "xgb" else N_TRIALS_CAT,
+    }]).to_csv(summary_path, index=False)
 
     print("\n[INFO] Saved:")
-    print(f"  {xgb_path}")
-    print(f"  {cat_path}")
-    print(f"  {sum_path}")
+    print(" ", preds_path)
+    print(" ", metrics_path)
+    print(" ", summary_path)
+    print(" ", f"params cache dir: {PARAMS_DIR}")
 
 
 if __name__ == "__main__":

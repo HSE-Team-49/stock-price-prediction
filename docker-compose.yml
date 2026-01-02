@@ -1,0 +1,31 @@
+services:
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./storage/mlflow:/mlflow
+
+  runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+    depends_on:
+      - mlflow
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./storage:/app/storage 
+    # runner запускается командой docker compose run runner <cmd>

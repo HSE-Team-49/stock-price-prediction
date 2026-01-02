@@ -1,0 +1,16 @@
+{
+  "model_kind": "xgb",
+  "test_year": 2024,
+  "overall": {
+    "RMSE": 0.07143139601167595,
+    "MAE": 0.054397842564500774,
+    "R2": -0.0070514255048936825
+  },
+  "n_rows": 1920,
+  "n_tickers": 160,
+  "holdout_months": 12,
+  "n_trials": 25,
+  "created_at": "2026-01-02T14:03:24.546950+00:00",
+  "commit_hash": "unknown",
+  "run_id": "e9b84be012a44575be973f211f64c5e8"
+}

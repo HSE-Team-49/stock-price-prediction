@@ -26,6 +26,7 @@ def predict_one(store: SQLiteStore, ticker: str, target_month: str) -> Dict[str,
     """
     target_month: 'YYYY-MM'
     """
+    
     active = store.get_active_model()
     if not active.active_model_path or active.active_experiment_id is None:
         raise ModelNotDeployedError("Active model is not set. Run scripts/set_active.py")
@@ -39,8 +40,9 @@ def predict_one(store: SQLiteStore, ticker: str, target_month: str) -> Dict[str,
         
         df = store.fetch_features_for_requests([(ticker, target_month)])
         if df.empty:
+            print(f"Features not found for ({ticker}, {target_month})")
             raise FeatureNotFoundError(f"Features not found for ({ticker}, {target_month})")
-
+        
         # feature columns are saved inside bundle to avoid drift
         X = df[bundle.feature_columns]
         
@@ -93,7 +95,7 @@ def predict_one(store: SQLiteStore, ticker: str, target_month: str) -> Dict[str,
         raise
 
 
-def predict_batch(store: SQLiteStore, requests: List[Tuple[str, str]]) -> pd.DataFrame:
+def predict_batch(store: SQLiteStore, requests: List[Tuple[str, str]]) -> list:
     """
     requests: list of (ticker, target_month 'YYYY-MM')
     """
@@ -101,4 +103,4 @@ def predict_batch(store: SQLiteStore, requests: List[Tuple[str, str]]) -> pd.Dat
     for tkr, tm in requests:
         res = predict_one(store, tkr, tm)
         rows.append(res)
-    return pd.DataFrame(rows)
+    return rows

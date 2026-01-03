@@ -7,6 +7,8 @@ services:
       - "5000:5000"
     volumes:
       - ./storage/mlflow:/mlflow
+    networks:
+      - ml-network
 
   runner:
     build:
@@ -23,9 +25,35 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
     ports:
       - "8000:8000"
     volumes:
       - ./src:/app/src
-      - ./storage:/app/storage 
+      - ./storage:/app/storage
+    networks:
+      - ml-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app/frontend  # для hot reload при разработке
+      - ./data:/app/data
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      - backend
+      - mlflow
+    networks:
+      - ml-network
+
+networks:
+  ml-network:
+    driver: bridge
     # runner запускается командой docker compose run runner <cmd>

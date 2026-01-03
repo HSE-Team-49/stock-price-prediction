@@ -2,6 +2,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+import pandas as pd
 from pydantic import BaseModel, Field, validator
 
 # Модель для входных данных
@@ -25,10 +26,6 @@ class PredictionResult(BaseModel):
     y_pred: float
 
 
-class ModelML():
-    ...
-
-
 
 class HistoryReq(BaseModel):
     id : int
@@ -45,3 +42,11 @@ class HistoryResponse(BaseModel):
     
 class StatsResponse(BaseModel):
     processing_time_stats: Dict[str, float]
+    
+    
+
+class RetrainOut(BaseModel):
+    experiment_id: int
+    run_id: Optional[str]
+    model_path: str
+    overall: Dict[str, float]

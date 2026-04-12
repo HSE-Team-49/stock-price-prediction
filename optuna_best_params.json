@@ -1,0 +1,31 @@
+{
+  "objective": "calinski_with_penalties",
+  "best_value": 1583.205382123396,
+  "best_params": {
+    "latent_dim": 3,
+    "hidden1": 256,
+    "hidden2": 32,
+    "batch_size": 8,
+    "epochs": 107,
+    "lr": 0.00015109025473502967,
+    "algo": "agglo",
+    "n_clusters": 12,
+    "agglo_linkage": "ward"
+  },
+  "best_user_attrs": {
+    "recon_mse": 0.011957465370067562,
+    "silhouette": 0.597566545009613,
+    "calinski": 1597.884765625,
+    "davies": 0.44337824686646865,
+    "n_clusters_found": 12,
+    "noise_ratio": 0.0,
+    "largest_cluster_size": 25,
+    "smallest_cluster_size": 4,
+    "largest_share": 0.16025641025641027,
+    "size_ratio": 6.25,
+    "penalty_small_k": 0.0,
+    "penalty_imbalance": 0.7339691750802005,
+    "penalty_tiny_cluster": 0.0,
+    "objective_value": 1583.205382123396
+  }
+}

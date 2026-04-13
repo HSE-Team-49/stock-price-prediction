@@ -813,9 +813,6 @@ def run_returns_branch(df: pd.DataFrame, cfg: Config) -> None:
         )
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def run_one_file(input_path: Path):
     cfg = Config(INPUT_PATH=input_path, EXAMPLE_TICKERS=[])

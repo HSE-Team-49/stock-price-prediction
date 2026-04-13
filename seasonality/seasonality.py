@@ -89,9 +89,6 @@ class Config:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ============================================================
-# UTILS
-# ============================================================
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -253,9 +250,6 @@ def find_dominant_periods(periods: np.ndarray, power: np.ndarray, top_k: int) ->
     })
 
 
-# ============================================================
-# DATASET / MODEL
-# ============================================================
 
 class WindowDataset(Dataset):
     def __init__(self, X: np.ndarray):
@@ -298,9 +292,6 @@ class Autoencoder(nn.Module):
         return self.decoder(z)
 
 
-# ============================================================
-# TRAIN / EVAL
-# ============================================================
 
 def train_one_epoch(model, loader, optimizer, criterion) -> float:
     model.train()
@@ -520,9 +511,6 @@ def reconstruct_series_with_ae(model: Autoencoder, x: np.ndarray, window_size: i
     return recon / counts
 
 
-# ============================================================
-# PREPARE WINDOWS FOR BRANCHES
-# ============================================================
 
 def prepare_branch_windows(
     df: pd.DataFrame,
@@ -561,9 +549,6 @@ def prepare_branch_windows(
     return X, series_map
 
 
-# ============================================================
-# FFT PIPELINE FOR BRANCH
-# ============================================================
 
 def run_fft_pipeline_for_branch(
     series_map: Dict[str, pd.Series],
@@ -739,9 +724,6 @@ def run_fft_pipeline_for_branch(
         print(f"[AE+FFT:{branch_name}] Временные ряды PDF: {ts_pdf_path}")
 
 
-# ============================================================
-# RUN BRANCHES
-# ============================================================
 
 def run_price_branch(df: pd.DataFrame, cfg: Config) -> None:
     print("\n" + "=" * 70)

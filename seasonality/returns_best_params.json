@@ -1,0 +1,28 @@
+{
+  "objective": "median_signal_share",
+  "best_value": 0.13499362068445409,
+  "best_params": {
+    "latent_dim": 20,
+    "hidden_dim": 64,
+    "n_layers": 3,
+    "dropout": 0.3216962405079847,
+    "batch_size": 1024,
+    "n_epochs": 16,
+    "lr": 0.0001051909502813386
+  },
+  "best_trial_user_attrs": {
+    "best_val_mse": 0.9359519643534859,
+    "recon_mse": 0.9359131803338103,
+    "median_signal_share": 0.13499362068445409,
+    "mean_signal_share": 0.13892435757811175,
+    "median_top1_period": 2.337642192347466,
+    "valid_ratio": 1.0,
+    "objective_value": 0.13499362068445409
+  },
+  "retrained_best_val_mse": 0.9359519643534859,
+  "retrained_recon_mse": 0.9359131803338103,
+  "retrained_median_signal_share": 0.13499362068445409,
+  "retrained_mean_signal_share": 0.13892435757811175,
+  "retrained_median_top1_period": 2.337642192347466,
+  "retrained_valid_ratio": 1.0
+}

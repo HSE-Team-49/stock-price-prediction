@@ -583,7 +583,7 @@ Alexey, этот README описывает **только артефакты и 
 
 ---
 
-# Сравнение XGB vs CAT (твой прогон)
+# Сравнение XGB vs CAT 
 
 Из сводок `*_optuna_summary_target_2024.csv`:
 

@@ -7,7 +7,7 @@ import math
 import argparse
 from typing import List, Tuple, Dict, Any
 
-# --- жестко фиксируем 16 CPU threads ---
+
 CPU_THREADS = 16
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS)
@@ -941,7 +941,6 @@ def main():
     print(f"[INFO] Base tickers (first_date <= first trading date 2008): {len(base_tickers)}")
     print(f"[INFO] Late tickers: {len(late_tickers)}")
 
-    # Базовая группа
     base_wide = build_wide_on_calendar(df, price_col, base_tickers, base_calendar)
 
     raw_counts = (
@@ -1160,7 +1159,6 @@ def main():
         centroid_cluster_ids.append(cid)
     centroids = np.array(centroids, dtype=np.float64)
 
-    # поздние компании: до старта торговли будут нули после minmax/fillna
     late_wide = build_wide_on_calendar(df, price_col, late_tickers, base_calendar)
     late_wide_filled = fill_wide_internal_gaps(late_wide)
     late_scaled = scale_minmax_wide(late_wide_filled)
@@ -1205,7 +1203,6 @@ def main():
     final_cluster_map.to_csv(args.out_csv, index=False)
     print(f"[INFO] Saved final cluster assignments → {args.out_csv}")
 
-    # Метрики 2 раза
     overall_companies = base_companies + late_companies_present
     overall_labels = np.concatenate([best["labels"], np.array(late_labels, dtype=int)]) if len(late_labels) > 0 else best["labels"].copy()
     Z_all = np.vstack([Z_base, Z_late]) if Z_late.shape[0] > 0 else Z_base.copy()

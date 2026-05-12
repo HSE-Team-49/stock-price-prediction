@@ -19,22 +19,15 @@ from joblib import Parallel, delayed
 from numba import njit, prange, set_num_threads, get_num_threads
 
 
-# ============================================================
-# USER SETTINGS — МЕНЯТЬ НАСТРОЙКИ ТОЛЬКО ЗДЕСЬ
-# ============================================================
-
 USER_INPUT_PATH = Path("data/prices_all.csv")
 USER_OUT_ROOT = Path("results_stocks")
 
-# Новый формат файла:
-# date, Ticker, Open, High, Low, Close, Volume
 USER_DATE_COL = "date"
 USER_TICKER_COL = "Ticker"
 USER_PRICE_COL = "Close"
 
-# CPU / Numba / joblib
-USER_CPU_N_JOBS = 30
-USER_NUMBA_NUM_THREADS = 30
+USER_CPU_N_JOBS = 16
+USER_NUMBA_NUM_THREADS = 16
 USER_JOBLIB_BATCH_SIZE = 16
 
 USER_PARALLEL_PREPARE_SERIES = True
@@ -59,8 +52,6 @@ USER_MIN_PERIOD = 2
 USER_MAX_PERIOD = 500
 USER_TOP_K = 5
 
-# Если None — используем все окна.
-# Если будет нехватка RAM/GPU, поставить 500_000 или 1_000_000.
 USER_MAX_WINDOWS = None
 
 # Ветки анализа
@@ -70,15 +61,8 @@ USER_RUN_AE_TRAIN = True
 USER_RUN_AE_FFT = True
 USER_RUN_RAW_FFT = True
 
-# Если список пустой — PDF строится для всех тикеров.
-# Если тикеров много, лучше указать несколько:
-# USER_EXAMPLE_TICKERS = ["ABBV", "BA", "C", "NKE"]
 USER_EXAMPLE_TICKERS = []
 
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 @dataclass
 class Config:
@@ -178,9 +162,6 @@ class Config:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ============================================================
-# SETUP
-# ============================================================
 
 def setup_torch_for_gpu() -> None:
     if not torch.cuda.is_available():
@@ -236,9 +217,6 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-# ============================================================
-# LOAD DATA
-# ============================================================
 
 def normalize_input_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df = df.copy()
@@ -299,9 +277,6 @@ def load_stocks_long(cfg: Config) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# SERIES PREPARATION
-# ============================================================
 
 def build_group_payloads(df: pd.DataFrame, cfg: Config) -> List[Tuple[str, np.ndarray, np.ndarray]]:
     payloads = []
@@ -420,9 +395,6 @@ def prepare_series_map_parallel(
     return series_map
 
 
-# ============================================================
-# WINDOW BUILDING
-# ============================================================
 
 def _build_windows_one_series(
     x: np.ndarray,
@@ -515,9 +487,6 @@ def train_val_split(X: np.ndarray, val_fraction: float) -> Tuple[np.ndarray, np.
     return X[:n_train], X[n_train:]
 
 
-# ============================================================
-# NUMBA HELPERS
-# ============================================================
 
 @njit(cache=True)
 def _estimate_prominence_simple(power: np.ndarray, idx: int) -> float:
@@ -645,9 +614,6 @@ def _overlap_average_from_window_outputs(
     return recon
 
 
-# ============================================================
-# FFT
-# ============================================================
 
 def period_band(period: float) -> str:
     if not np.isfinite(period):
@@ -749,9 +715,6 @@ def find_dominant_periods(
     return df
 
 
-# ============================================================
-# MODEL
-# ============================================================
 
 class Autoencoder(nn.Module):
     def __init__(
@@ -823,9 +786,6 @@ def maybe_compile_model(model: nn.Module, cfg: Config) -> nn.Module:
         return model
 
 
-# ============================================================
-# GPU TRAINING
-# ============================================================
 
 def to_gpu_tensor(X: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(X).to(DEVICE, non_blocking=True)
@@ -1176,10 +1136,6 @@ def load_trained_model(
     return model
 
 
-# ============================================================
-# GPU RECONSTRUCTION — НЕ ПАРАЛЛЕЛИМ
-# ============================================================
-
 @torch.no_grad()
 def reconstruct_series_with_ae(
     model: Autoencoder,
@@ -1230,9 +1186,6 @@ def reconstruct_series_with_ae(
     return recon
 
 
-# ============================================================
-# FFT ANALYSIS
-# ============================================================
 
 def add_fft_rows_for_series(
     rows: List[Dict[str, Any]],
@@ -1660,9 +1613,6 @@ def run_fft_pipeline_for_branch(
         print(f"[FFT:{branch_name}] Временные ряды PDF: {ts_pdf_path}")
 
 
-# ============================================================
-# BRANCHES
-# ============================================================
 
 def run_price_branch(df: pd.DataFrame, cfg: Config) -> None:
     print("\n" + "=" * 70)

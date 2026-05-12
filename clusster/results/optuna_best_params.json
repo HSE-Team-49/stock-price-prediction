@@ -1,0 +1,36 @@
+{
+  "objective": "log1p(calinski)_with_penalties",
+  "best_value": 6.7986361487868265,
+  "best_params": {
+    "latent_dim": 14,
+    "hidden1": 64,
+    "hidden2": 64,
+    "batch_size": 128,
+    "epochs": 49,
+    "lr": 0.0001716468943967117,
+    "algo": "gmm",
+    "n_clusters": 7,
+    "gmm_covariance_type": "spherical",
+    "gmm_reg_covar": 0.0003027929242932633
+  },
+  "best_user_attrs": {
+    "calinski": 895.6235961914062,
+    "davies": 0.4853992304309332,
+    "largest_cluster_size": 33,
+    "largest_share": 0.20625,
+    "log_calinski": 6.7986361487868265,
+    "n_clusters_found": 7,
+    "noise_ratio": 0.0,
+    "objective_value": 6.7986361487868265,
+    "penalty_imbalance": 0.0,
+    "penalty_small_k": 0.0,
+    "penalty_tiny_cluster": 0.0,
+    "recon_mse": 0.030913986265659332,
+    "silhouette": 0.5828741788864136,
+    "size_ratio": 2.75,
+    "smallest_cluster_size": 12
+  },
+  "base_trade_date_2008": "2008-01-02",
+  "etalon_ticker": "AAPL",
+  "cpu_threads": 16
+}

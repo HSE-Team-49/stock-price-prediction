@@ -1,0 +1,31 @@
+{
+  "base_group_metrics_latent_space": {
+    "silhouette": 0.5828741788864136,
+    "calinski": 895.6235961914062,
+    "davies": 0.4853992304309332,
+    "noise_ratio": 0.0,
+    "n_clusters_found": 7,
+    "largest_cluster_size": 33,
+    "smallest_cluster_size": 12,
+    "largest_share": 0.20625,
+    "size_ratio": 2.75
+  },
+  "base_group_objective_value": 6.7986361487868265,
+  "base_group_log_calinski": 6.7986361487868265,
+  "base_group_recon_mse": 0.030913986265659332,
+  "overall_metrics_latent_space": {
+    "silhouette": 0.5604314208030701,
+    "calinski": 747.2344970703125,
+    "davies": 0.49827745192708184,
+    "noise_ratio": 0.0,
+    "n_clusters_found": 7,
+    "largest_cluster_size": 35,
+    "smallest_cluster_size": 13,
+    "largest_share": 0.175,
+    "size_ratio": 2.6923076923076925
+  },
+  "overall_log_calinski": 6.6177164276011124,
+  "n_base_companies": 160,
+  "n_late_companies": 40,
+  "n_total_companies_final": 200
+}

@@ -1,790 +1,1011 @@
-# README: сравнение моделей прогноза акций
+# Сравнение XGBoost-моделей прогнозирования цен акций в rolling/direct и fixed-origin постановках
 
-## 1. Общая постановка задачи
+## Аннотация
 
-В проекте исследуется прогнозирование цен акций на разных временных масштабах:
+В данном эксперименте исследуется качество прогнозирования цен акций с помощью моделей XGBoost в двух постановках оценки:
+
+1. **Rolling/direct forecast** — оценка обновляемого прогноза, при которой признаки для каждого горизонта формируются на дату, отстоящую от целевой даты на величину горизонта.
+2. **Fixed-origin forecast** — оценка прогноза из одной начальной точки, при которой весь будущий период прогнозируется на основе признаков, доступных только на момент начала прогноза.
+
+Цель сравнения — отделить качество модели в режиме регулярного обновления прогноза от качества модели в более строгом сценарии, когда требуется построить весь прогнозируемый период из одной даты без использования фактических цен внутри будущего интервала.
+
+В работе сравниваются глобальные XGBoost-модели и модели, обученные отдельно внутри кластеров акций:
+
+- `global` — одна модель обучается на всех тикерах;
+- `per-cluster` — отдельные модели обучаются для каждого кластера акций.
+
+Рассматриваются три частоты прогнозирования:
+
+- дневная (`daily`);
+- недельная (`weekly`);
+- месячная (`monthly`).
+
+Основная метрика качества — **WAPE**.
+
+---
+
+## 1. Постановка задачи
+
+Пусть для акции доступен временной ряд цен:
 
 ```text
-1. Недельный прогноз — последний год.
-2. Месячный прогноз — последний год.
-3. Дневной прогноз — последний месяц.
+P_t
 ```
 
-Для всех вариантов используется одна общая идея:
+Для горизонта `h` целевая переменная задаётся через логарифмическую доходность:
 
 ```text
-XGBoost + Optuna + признаки ценовой динамики + объём торгов + макро + сезонность + кластеры
+target_h = log(P_{t+h}) - log(P_t)
 ```
 
-Целевая переменная во всех моделях строится через логарифмическую доходность:
+Модель прогнозирует `target_h`, после чего прогноз цены восстанавливается как:
 
 ```text
-target_logret_h = log(price[t+h]) - log(price[t])
+P_hat_{t+h} = P_t * exp(target_hat_h)
 ```
 
-После прогноза лог-доходности цена восстанавливается так:
+Оценка качества производится по восстановленным ценам.
+
+---
+
+## 2. Две постановки оценки качества
+
+### 2.1 Rolling/direct forecast
+
+В rolling/direct постановке для каждого горизонта `h` признаки формируются на дату:
 
 ```text
-pred_price = price[t] * exp(pred_logret_h)
+feature_date = target_date - h
 ```
 
-Основные метрики качества:
+Это означает, что для каждой целевой даты используется максимально близкая к ней доступная точка истории.
+
+Такой режим соответствует сценарию **регулярно обновляемого прогноза**:
 
 ```text
-WAPE
+каждый новый период появляются новые фактические цены;
+признаки пересобираются;
+модель строит прогноз на следующий горизонт.
+```
+
+Эта постановка полезна, если модель предполагается использовать как постоянно обновляемую систему прогнозирования.
+
+---
+
+### 2.2 Fixed-origin forecast
+
+В fixed-origin постановке выбирается одна начальная дата прогноза:
+
+```text
+origin_date = последняя доступная дата до начала прогнозируемого периода
+```
+
+Для всех горизонтов используются признаки только на этой дате:
+
+```text
+feature_date = origin_date
+```
+
+Далее модель строит прогнозы:
+
+```text
+origin_date + 1 шаг
+origin_date + 2 шага
+...
+origin_date + H шагов
+```
+
+Фактические цены внутри прогнозируемого периода используются только для расчёта метрик, но не используются как признаки.
+
+Такой режим соответствует более строгой задаче:
+
+```text
+построить весь будущий период из одной начальной точки.
+```
+
+---
+
+## 3. Используемые данные
+
+В эксперименте используются дневные OHLCV-данные по акциям.
+
+Основные входные файлы:
+
+```text
+data/prices_all.csv
+data/prices_all_2025_12_20_today.csv
+cluster_fullstart_assignments.csv
+results_stocks/prices_all/
+data/
+```
+
+Назначение файлов:
+
+| Файл / директория | Назначение |
+|---|---|
+| `data/prices_all.csv` | Основной исторический файл с ценами |
+| `data/prices_all_2025_12_20_today.csv` | Дополнительные фактические цены для периода проверки |
+| `cluster_fullstart_assignments.csv` | Разметка тикеров по кластерам |
+| `results_stocks/prices_all/` | Сезонные FFT-признаки |
+| `data/` | Макроэкономические признаки |
+
+Макроэкономические признаки ограничиваются датой:
+
+```text
+macro_known_until = 2025-12-20
+```
+
+Это означает, что значения макропоказателей после этой даты не используются как известные факты. Для последующих дат применяются последние доступные значения и признаки возраста макроэкономической информации.
+
+---
+
+## 4. Модели
+
+Были построены шесть основных вариантов моделей:
+
+| Папка / архив | Модель | Частота | Тип модели | Горизонты |
+|---|---|---|---|---|
+| `daily_global/` | `daily_global` | Daily | Global XGBoost | h=1..21 торговый день |
+| `daily_per_cluster/` | `daily_per_cluster` | Daily | Per-cluster XGBoost | h=1..21 торговый день |
+| `weekly_global/` | `weekly_global` | Weekly | Global XGBoost | h=1..52 недели |
+| `weekly_per_cluster/` | `weekly_per_cluster` | Weekly | Per-cluster XGBoost | h=1..52 недели |
+| `monthly_global/` | `monthly_global` | Monthly | Global XGBoost | h=1..12 месяцев |
+| `monthly_per_cluster/` | `monthly_per_cluster` | Monthly | Per-cluster XGBoost | h=1..12 месяцев |
+
+---
+
+## 5. Разделение горизонтов
+
+Для каждой частоты горизонты делятся на две группы:
+
+1. `short_macro` — короткие горизонты, где используются макроэкономические признаки;
+2. `long_no_macro` — длинные горизонты, где макроэкономические признаки исключаются.
+
+| Частота | Общий горизонт | `short_macro` | `long_no_macro` |
+|---|---:|---:|---:|
+| Daily | 21 торговый день | h=1..5 | h=6..21 |
+| Weekly | 52 недели | h=1..13 | h=14..52 |
+| Monthly | 12 месяцев | h=1..3 | h=4..12 |
+
+Такое разделение используется для снижения риска чрезмерной зависимости длинного прогноза от макроэкономических признаков, которые в реальной постановке могут быть неизвестны или устаревать.
+
+---
+
+## 6. Признаки
+
+Во всех вариантах используются одинаковые группы признаков, соответствующие исходным XGBoost-моделям.
+
+Основные группы признаков:
+
+```text
+price / log_price
+returns
+return lags
+price lags
+rolling mean / std / min / max / median / skew / kurt
+momentum
+realized volatility
+downside volatility
+upside volatility
+ATR
+RSI
+SMA / EMA
+MACD
+Bollinger Bands
+distance from rolling high / low
+volume features
+market-wide features
+cluster features
+rank features
+season / FFT features
+macro features
+macro age / freeze features
+calendar features
+ticker encoded features
+cluster encoded features
+horizon
+```
+
+Для недельной и месячной частот дневные данные агрегируются.
+
+### 6.1 Weekly-признаки
+
+Для weekly-моделей формируются недельные агрегаты:
+
+```text
+week_price
+week_open
+week_high
+week_low
+week_close
+week_volume
+trading_days_in_week
+daily_ret_mean_in_week
+daily_ret_std_in_week
+daily_ret_min_in_week
+daily_ret_max_in_week
+daily_ret_sum_in_week
+daily_volume_mean_in_week
+daily_volume_std_in_week
+daily_volume_max_in_week
+```
+
+### 6.2 Monthly-признаки
+
+Для monthly-моделей формируются месячные агрегаты:
+
+```text
+month_price
+month_open
+month_high
+month_low
+month_close
+month_volume
+trading_days_in_month
+daily_ret_mean_in_month
+daily_ret_std_in_month
+daily_ret_min_in_month
+daily_ret_max_in_month
+daily_ret_sum_in_month
+daily_volume_mean_in_month
+daily_volume_std_in_month
+daily_volume_max_in_month
+```
+
+---
+
+## 7. Защита от утечки информации
+
+Для fixed-origin постановки используются следующие ограничения.
+
+### 7.1 Единая дата признаков
+
+Для всех горизонтов используется одна дата признаков:
+
+```text
+feature_date = origin_date
+```
+
+Цена внутри прогнозируемого периода не используется как feature.
+
+---
+
+### 7.2 Ограничение target-даты при обучении
+
+В обучающей выборке используются только те строки, у которых целевая дата находится до начала периода оценки:
+
+```text
+target_date < eval_start
+```
+
+Это исключает попадание фактических значений из evaluation-периода в обучение.
+
+---
+
+### 7.3 Ограничение макроэкономических данных
+
+Макроэкономические ряды обрезаются по дате:
+
+```text
+macro_known_until = 2025-12-20
+```
+
+После этой даты модель получает не будущие макроэкономические значения, а последние доступные значения и признаки возраста информации:
+
+```text
+*_age_available_days
+*_age_observation_days
+*_after_macro_known_until
+```
+
+---
+
+## 8. Метрики
+
+Основная метрика — **WAPE**:
+
+```text
+WAPE = 100 * sum(abs(actual_price - predicted_price)) / sum(abs(actual_price))
+```
+
+Дополнительно считаются:
+
+```text
 MAPE
 MSE
 MAE
 RMSE
 ```
 
-В качестве основной метрики для сравнения чаще использовалась `WAPE`, потому что она устойчивее обычного MAPE при разных масштабах цен акций.
+Метрики считаются по цене, а не по логарифмической доходности.
 
 ---
 
-## 2. Исходные данные
+## 9. Итоговые fixed-origin результаты
 
-### 2.1. Ценовые данные
+### 9.1 Общие метрики
 
-Используются два файла:
+| Модель | n | WAPE | MAPE | MAE | RMSE |
+|---|---:|---:|---:|---:|---:|
+| **daily_global** | 4179 | **7.43%** | 6.84% | 20.69 | **40.62** |
+| daily_per_cluster | 4179 | 7.49% | **6.79%** | 20.86 | 45.55 |
+| **weekly_global** | 10329 | **19.36%** | **22.50%** | **53.81** | **263.45** |
+| weekly_per_cluster | 10329 | 20.85% | 23.50% | 57.94 | 293.14 |
+| monthly_global | 2384 | 21.85% | 25.18% | 60.79 | 249.22 |
+| **monthly_per_cluster** | 2384 | **21.83%** | **24.68%** | **60.74** | **248.08** |
 
-```text
-data/prices_all.csv
-data/prices_all_2025_12_20_today.csv
-```
+### 9.2 Основные выводы по fixed-origin
 
-Первый файл содержит исторические данные до конца 2025 года, второй — фактические данные после `2025-12-20` до `2026-05-08`.
+По WAPE лучшие модели:
 
-Основные колонки:
+| Частота | Лучшая модель | WAPE |
+|---|---|---:|
+| Daily | `daily_global` | 7.43% |
+| Weekly | `weekly_global` | 19.36% |
+| Monthly | `monthly_per_cluster` | 21.83% |
 
-```text
-date
-Ticker
-Open
-High
-Low
-Close
-Volume
-```
-
-В качестве основной цены использовалась колонка:
+При этом разница между `monthly_global` и `monthly_per_cluster` минимальна:
 
 ```text
-Close
+monthly_global:      WAPE 21.85%
+monthly_per_cluster: WAPE 21.83%
 ```
+
+То есть для месячного прогноза global и per-cluster модели практически эквивалентны по WAPE.
 
 ---
 
-### 2.2. Макропоказатели
+## 10. Анализ по группам горизонтов
 
-Используются макропоказатели из папки:
+| Модель | short_macro WAPE | long_no_macro WAPE |
+|---|---:|---:|
+| daily_global | 5.03% | **8.17%** |
+| daily_per_cluster | **4.46%** | 8.42% |
+| weekly_global | 7.69% | **23.16%** |
+| weekly_per_cluster | **7.49%** | 25.20% |
+| monthly_global | 12.83% | **24.83%** |
+| monthly_per_cluster | **10.28%** | 25.65% |
 
-```text
-data/
-```
-
-Список макро-файлов:
-
-```text
-CPIAUCSL.csv      — CPI, индекс потребительских цен
-DCOILBRENTEU.csv  — Brent spot
-DEXUSEU.csv       — USD/EUR
-DGS2.csv          — доходность 2-летних UST
-DGS10.csv         — доходность 10-летних UST
-DGS30.csv         — доходность 30-летних UST
-EFFR.csv          — Effective Federal Funds Rate
-M2SL.csv          — денежная масса M2
-UNRATE.csv        — уровень безработицы
-```
-
-Для макро учитывались лаги публикации:
+По всем трём частотам наблюдается один и тот же эффект:
 
 ```text
-месячные макро: 21 бизнес-день
-дневные макро: 1 бизнес-день
-```
----
-
-### 2.3. Кластеры
-
-Кластеры загружаются из файла:
-
-```text
-cluster_fullstart_assignments.csv
+per-cluster модели лучше на коротких горизонтах;
+global модели лучше на длинных горизонтах.
 ```
 
-Используются признаки:
+Интерпретация:
 
-```text
-cluster_id
-cluster_size
-cluster_share
-cluster_is_noise
-```
-
-В отдельных экспериментах модели обучались отдельно для каждого `cluster_id`.
+- на коротком горизонте кластеры помогают учитывать локальную структуру рынка;
+- на длинном горизонте внутри кластеров становится меньше обучающих примеров;
+- global-модель лучше обобщает долгосрочную динамику за счёт большего объёма данных.
 
 ---
 
-### 2.4. Сезонность
+## 11. Гибридная схема
 
-Результаты поиска сезонности загружаются из:
-
-```text
-results_stocks/prices_all
-```
-
-Используются FFT-признаки:
+На основе анализа по группам горизонтов можно построить гибридный вариант:
 
 ```text
-period_days
-peak_share
-prominence
-signal_share
-noise_share
-norm_peak_share
-period_band
+short_macro   -> per-cluster
+long_no_macro -> global
 ```
 
-Также добавляются фазовые признаки сезонности:
+### 11.1 Гибрид по частотам
 
-```text
-season_*_phase_sin
-season_*_phase_cos
-```
+| Частота | short model | long model | WAPE |
+|---|---|---|---:|
+| Daily | per-cluster | global | **7.30%** |
+| Weekly | per-cluster | global | **19.31%** |
+| Monthly | per-cluster | global | **21.22%** |
+
+### 11.2 Сравнение гибрида с чистыми моделями
+
+| Частота | Global WAPE | Per-cluster WAPE | Hybrid WAPE |
+|---|---:|---:|---:|
+| Daily | 7.43% | 7.49% | **7.30%** |
+| Weekly | 19.36% | 20.85% | **19.31%** |
+| Monthly | 21.85% | 21.83% | **21.22%** |
+
+Гибридная схема даёт лучший результат среди рассмотренных вариантов.
 
 ---
 
-## 3. Общая архитектура моделей
+## 12. Сравнение rolling/direct и fixed-origin
 
-Все модели построены по схеме разделения горизонта на две части:
+Rolling/direct оценка измеряет качество обновляемого прогноза. Fixed-origin оценка измеряет качество прогноза всего будущего периода из одной начальной точки.
 
-```text
-short_macro
-long_no_macro
-```
+| Частота | Модель | Rolling/direct WAPE | Fixed-origin WAPE | Разница |
+|---|---|---:|---:|---:|
+| Daily | global | **6.15%** | 7.43% | +1.28 п.п. |
+| Daily | per-cluster | **6.31%** | 7.49% | +1.18 п.п. |
+| Weekly | global | **17.32%** | 19.36% | +2.04 п.п. |
+| Weekly | per-cluster | **17.90%** | 20.85% | +2.95 п.п. |
+| Monthly | global | **19.47%** | 21.85% | +2.38 п.п. |
+| Monthly | per-cluster | **19.19%** | 21.83% | +2.64 п.п. |
 
-### 3.1. Short-модель
+### 12.1 Интерпретация различий
 
-Short-модель использует все признаки, включая макро:
+Rolling/direct постановка даёт более низкую ошибку, поскольку признаки обновляются по мере движения по тестовому периоду.
 
-```text
-short_macro = price features + volume features + market features + cluster features + season features + macro features
-```
+Fixed-origin постановка сложнее, так как весь прогноз строится из одной точки. Поэтому рост ошибки на `1.2–3.0 п.п. WAPE` является ожидаемым.
 
-Идея: на коротких горизонтах последнее известное макросостояние может быть полезным.
+### 12.2 Практический смысл
 
----
+Обе постановки имеют практическую интерпретацию:
 
-### 3.2. Long-модель
-
-Long-модель не использует макро и производные макро-признаки:
-
-```text
-long_no_macro = все признаки, кроме macro features
-```
-
-Идея: на дальних горизонтах будущие макро-показатели неизвестны, а замороженные старые значения могут ухудшать переносимость модели.
+| Постановка | Что измеряет | Когда уместна |
+|---|---|---|
+| Rolling/direct | Качество регулярно обновляемого прогноза | Если модель будет переоцениваться/обновляться по мере появления новых цен |
+| Fixed-origin | Качество прогноза всего периода из одной даты | Если требуется построить долгосрочный прогноз без знания будущей ценовой траектории |
 
 ---
 
-## 4. Основные группы признаков
+## 13. Анализ по кластерам
 
-Во всех версиях использовались близкие группы признаков.
+### 13.1 Наиболее сложные кластеры
 
-### 4.1. Ценовые признаки
+| Частота | Наиболее сложные кластеры |
+|---|---|
+| Daily | `cluster_3` — WAPE 12.93% |
+| Weekly | `cluster_3` — WAPE 30.24%, `cluster_4` — WAPE 29.86% |
+| Monthly | `cluster_3` — WAPE 38.69%, `cluster_4` — WAPE 25.06% |
 
-```text
-price
-log_price
-price_ratio
-price_momentum
-distance_from_high
-distance_from_low
-```
+### 13.2 Наиболее устойчивые кластеры
 
-### 4.2. Доходности
+| Частота | Лучший кластер |
+|---|---|
+| Daily | `cluster_6` — WAPE 4.24% |
+| Weekly | `cluster_6` — WAPE 10.50% |
+| Monthly | `cluster_6` — WAPE 12.29% |
 
-```text
-ret_lag
-ret_abs_lag
-ret_sign
-ret_roll_mean
-ret_roll_std
-ret_roll_min
-ret_roll_max
-ret_roll_median
-ret_roll_skew
-ret_roll_kurt
-realized_vol
-downside_vol
-upside_vol
-```
-
-### 4.3. Технические индикаторы
+Вывод:
 
 ```text
-ATR
-RSI
-SMA
-EMA
-MACD
-Bollinger Bands
-```
-
-### 4.4. Объём торгов
-
-```text
-Volume
-volume_lag
-volume_change
-volume_roll_mean
-volume_roll_std
-volume_zscore
-ret_volume_corr
-```
-
-### 4.5. Рыночные признаки
-
-```text
-market_return
-market_return_lags
-market_rolling_mean
-market_rolling_std
-market_regime_bull
-market_regime_bear
-excess_return
-beta_to_market
-correlation_with_market
-```
-
-
-### 4.6. Кластерные признаки
-
-```text
-cluster_id
-cluster_size
-cluster_share
-cluster_is_noise
-cluster_return_mean
-cluster_return_std
-ret_minus_cluster_mean
-ret_zscore_in_cluster
-```
-
-### 4.7. Сезонные признаки
-
-```text
-season_period_days
-season_peak_share
-season_prominence
-season_signal_share
-season_noise_share
-season_phase_sin
-season_phase_cos
-```
-
-### 4.8. Макро-признаки
-
-```text
-macro value
-macro lag
-macro diff
-macro pct_change
-macro rolling mean
-macro rolling std
-macro z-score
-macro age features
-yield spreads
-interest-rate spreads
-inflation growth
-money supply growth
-unemployment changes
+cluster_3 и cluster_4 требуют дополнительного анализа;
+cluster_6 прогнозируется наиболее стабильно.
 ```
 
 ---
 
-# 5. Недельные модели
+## 14. Анализ по тикерам
 
-## 5.1. Лучшая недельная модель
-
-Файл:
+Среди наиболее сложных тикеров регулярно встречаются:
 
 ```text
-global_xgb_weekly_h100_forecast_two_models.py
+WDC
+MU
+BKNG
+WBD
+AMD
+CVNA
+LRCX
+GLW
+VRT
+NEM
 ```
 
-### Подход
-
-Данные агрегируются по неделям.
-
-Горизонты:
+Для дневного прогноза особенно сложными являются:
 
 ```text
-1–13 недель   -> short_macro
-14–52 недели  -> long_no_macro
+INTC
+AMD
+MRVL
+MU
+WDC
 ```
 
-Модель глобальная:
+Возможные причины высокой ошибки:
 
-```text
-одна short_macro модель на все тикеры
-одна long_no_macro модель на все тикеры
-```
-
-Кластеры используются как признаки, но не как отдельные модели.
-
-### Результат
-
-```text
-WAPE ≈ 17.32%
-MAPE ≈ 19.97%
-RMSE ≈ 233.61
-```
-
-### Вывод
-
-Это лучшая недельная модель. Она стабильнее кластерной версии и остаётся основной недельной моделью.
+- высокая волатильность;
+- резкие движения на новостях;
+- зависимость от секторальных факторов;
+- индивидуальные корпоративные события;
+- недостаточность только технических, макроэкономических и кластерных признаков.
 
 ---
 
-## 5.2. Недельная модель по кластерам
+## 15. Соответствие папок, моделей и файлов
 
-Файл:
+### 15.1 Общая структура результатов
 
-```text
-global_xgb_weekly_h100_forecast_per_cluster.py
-```
-
-### Подход
-
-Для каждого `cluster_id` обучаются отдельные модели:
+После запуска формируется директория:
 
 ```text
-cluster_{id}_short_macro
-cluster_{id}_long_no_macro
+results_xgb_old_features_fixed_origin/run_YYYYMMDD_HHMMSS/
 ```
 
-Горизонты такие же:
+Внутри:
 
 ```text
-1–13 недель   -> short_macro
-14–52 недели  -> long_no_macro
+daily_global/
+daily_per_cluster/
+weekly_global/
+weekly_per_cluster/
+monthly_global/
+monthly_per_cluster/
+_status/
+_embedded_scripts/
+fixed_origin_metrics_all_models.csv
+single_runner_config.json
 ```
-
-### Результат
-
-```text
-WAPE ≈ 17.90%
-MAPE ≈ 20.47%
-RMSE ≈ 261.78
-```
-
-### Вывод
-
-per-cluster версия оказалась хуже глобальной недельной модели.  
-Кластеризация помогала отдельным группам акций, но ухудшала результат на других кластерах.
 
 ---
 
-## 5.3. Недельная гибридная схема
+### 15.2 `daily_global`
 
-Отдельного финального `.py` файла пока нет.
-
-### Идея
-
-Использовать кластерные модели только там, где они работают лучше, а для проблемного кластера использовать fallback.
-
-По результатам эксперимента лучшая гибридная схема:
+Назначение:
 
 ```text
-clusters 0,1,2,3,5,6 -> per-cluster model
-cluster 4             -> fallback
-```
-
-### Потенциальный результат
-
-```text
-WAPE ≈ 16.95%
-MAPE ≈ 19.21%
-RMSE ≈ 216.31
-```
-
-### Вывод
-
-Гибридная недельная схема потенциально лучше чистой глобальной модели, но для неё нужен отдельный финальный код.
-
----
-
-# 6. Месячные модели
-
-## 6.1. Месячная глобальная модель
-
-Файл:
-
-```text
-global_xgb_monthly_h100_forecast_two_models.py
-```
-
-### Подход
-
-Данные агрегируются по месяцам.
-
-Горизонты:
-
-```text
-1–3 месяца    -> short_macro
-4–12 месяцев  -> long_no_macro
-```
-
-Модель глобальная:
-
-```text
-одна short_macro модель на все тикеры
-одна long_no_macro модель на все тикеры
-```
-
-### Результат
-
-```text
-WAPE ≈ 19.47%
-MAPE ≈ 22.08%
-RMSE ≈ 233.84
-```
-
-### Вывод
-
-Месячная глобальная модель рабочая, но хуже недельной. Основная причина — потеря части информации при месячной агрегации и меньшее число обучающих наблюдений.
-
----
-
-## 6.2. Месячная модель по кластерам
-
-Файл:
-
-```text
-global_xgb_monthly_h100_forecast_per_cluster.py
-```
-
-### Подход
-
-Для каждого кластера обучаются отдельные модели:
-
-```text
-cluster_{id}_short_macro
-cluster_{id}_long_no_macro
+Глобальная дневная модель XGBoost по всем тикерам.
 ```
 
 Горизонты:
 
 ```text
-1–3 месяца    -> short_macro
-4–12 месяцев  -> long_no_macro
+h=1..21 торговый день
 ```
 
-### Результат
+Группы:
 
 ```text
-WAPE ≈ 19.19%
-MAPE ≈ 21.75%
-RMSE ≈ 241.05
+short_macro:   h=1..5
+long_no_macro: h=6..21
 ```
 
-### Вывод
+Основные файлы метрик:
 
-Месячная per-cluster модель лучше месячной глобальной по WAPE/MAPE/MAE, но хуже по MSE/RMSE.  
-Если нужна именно месячная постановка, лучшая текущая месячная версия — per-cluster.
+```text
+fixed_origin_daily_predictions.csv
+fixed_origin_daily_metrics_overall.json
+fixed_origin_daily_metrics_by_horizon.csv
+fixed_origin_daily_metrics_by_model_group.csv
+fixed_origin_daily_metrics_by_date.csv
+fixed_origin_daily_metrics_by_ticker.csv
+```
+
+Файлы моделей:
+
+```text
+global_xgb_daily_model_short_macro.json
+global_xgb_daily_model_long_no_macro.json
+```
 
 ---
 
-# 7. Дневные модели
+### 15.3 `daily_per_cluster`
 
-## 7.1. Дневная глобальная модель
-
-Файл:
+Назначение:
 
 ```text
-global_xgb_daily_last_month_h100_forecast_clean.py
-```
-
-### Подход
-
-Данные используются в дневном виде.
-
-Backtest:
-
-```text
-2026-04-08 — 2026-05-08
+Дневные XGBoost-модели, обученные отдельно внутри каждого кластера.
 ```
 
 Горизонты:
 
 ```text
-1–5 торговых дней   -> short_macro
-6–21 торговый день  -> long_no_macro
+h=1..21 торговый день
 ```
 
-### Особенности реализации
-
-Дневная версия оказалась самой тяжёлой по RAM. Для стабильного запуска были внесены технические оптимизации:
+Группы:
 
 ```text
-1. Сохранение признаков батчами в parquet.
-2. Использование threading вместо loky.
-3. Сжатие float64/int64 до float32/int32.
-4. Облегчение тяжёлых rolling-блоков.
-5. Resume-режим для продолжения после сохранения short-модели.
-6. Использование более компактного формата матрицы для финального обучения.
+short_macro:   h=1..5
+long_no_macro: h=6..21
 ```
 
-Важно: эти изменения в основном касаются памяти и не меняют постановку прогноза.
-
-### Результат
+Основные файлы метрик:
 
 ```text
-WAPE ≈ 6.1516%
-MAPE ≈ 5.9135%
-MSE ≈ 1189.18
-MAE ≈ 17.15
-RMSE ≈ 34.48
-n = 96 117
+fixed_origin_daily_predictions.csv
+fixed_origin_daily_metrics_overall.json
+fixed_origin_daily_metrics_by_horizon.csv
+fixed_origin_daily_metrics_by_model_group.csv
+fixed_origin_daily_metrics_by_date.csv
+fixed_origin_daily_metrics_by_ticker.csv
+fixed_origin_daily_metrics_by_cluster.csv
 ```
 
-### Вывод
+Примеры файлов моделей:
 
-Это лучшая дневная модель.  
-На последнем месяце она показала очень хорошее качество, но её нельзя напрямую сравнивать с недельными/месячными моделями, потому что проверочный период и горизонт другие.
+```text
+cluster_0_xgb_daily_model_short_macro.json
+cluster_0_xgb_daily_model_long_no_macro.json
+cluster_1_xgb_daily_model_short_macro.json
+cluster_1_xgb_daily_model_long_no_macro.json
+```
 
 ---
 
-## 7.2. Дневная модель по кластерам
+### 15.4 `weekly_global`
 
-Файл:
-
-```text
-global_xgb_daily_last_month_h100_forecast_per_cluster.py
-```
-
-### Подход
-
-Для каждого кластера обучаются отдельные дневные модели:
+Назначение:
 
 ```text
-cluster_{id}_short_macro
-cluster_{id}_long_no_macro
+Глобальная недельная модель XGBoost по всем тикерам.
 ```
 
 Горизонты:
 
 ```text
-1–5 дней   -> short_macro
-6–21 день  -> long_no_macro
+h=1..52 недели
 ```
 
-### Результат
+Группы:
 
 ```text
-WAPE ≈ 6.3146%
-MAPE ≈ 5.9787%
-MSE ≈ 1560.56
-MAE ≈ 17.60
-RMSE ≈ 39.50
-n = 96 117
+short_macro:   h=1..13
+long_no_macro: h=14..52
 ```
 
-### Вывод
-
-дневная per-cluster модель хуже глобальной дневной модели по всем основным метрикам.
-
-При этом per-cluster улучшила результат для части тикеров и кластеров:
+Основные файлы метрик:
 
 ```text
-clusters 0, 2, 3
+fixed_origin_weekly_predictions.csv
+fixed_origin_weekly_metrics_overall.json
+fixed_origin_weekly_metrics_by_horizon.csv
+fixed_origin_weekly_metrics_by_model_group.csv
+fixed_origin_weekly_metrics_by_date.csv
+fixed_origin_weekly_metrics_by_ticker.csv
 ```
 
-Но ухудшение на других кластерах, особенно на cluster 4, перекрыло этот выигрыш.
-
----
-
-## 7.3. Дневная гибридная схема
-
-Отдельного финального `.py` файла пока нет.
-
-### Идея
-
-Использовать:
+Файлы моделей:
 
 ```text
-clusters 0, 2, 3 -> per-cluster daily
-clusters 1, 4, 5, 6 -> global daily
-```
-
-### Потенциальный результат
-
-```text
-WAPE ≈ 6.0798%
-MAPE ≈ 5.9277%
-MSE ≈ 1145.16
-MAE ≈ 16.95
-RMSE ≈ 33.84
-```
-
-### Вывод
-
-Гибридная дневная схема даёт лучший WAPE/RMSE, но MAPE чуть хуже, чем у чистой global daily.
-
----
-
-# 8. Сводная таблица результатов
-
-| Масштаб | Модель | `.py` файл | WAPE | MAPE | RMSE | Статус |
-|---|---|---|---:|---:|---:|---|
-| Weekly | Global two_models | `global_xgb_weekly_h100_forecast_two_models.py` | **17.32%** | **19.97%** | **233.61** | Лучшая weekly |
-| Weekly | Per-cluster | `global_xgb_weekly_h100_forecast_per_cluster.py` | 17.90% | 20.47% | 261.78 | Исследовательская |
-| Weekly | Hybrid | отдельного файла нет | **16.95%** | **19.21%** | **216.31** | Потенциально лучшая weekly |
-| Monthly | Global two_models | `global_xgb_monthly_h100_forecast_two_models.py` | 19.47% | 22.08% | **233.84** | Baseline monthly |
-| Monthly | Per-cluster | `global_xgb_monthly_h100_forecast_per_cluster.py` | **19.19%** | **21.75%** | 241.05 | Лучшая monthly |
-| Daily | Global clean | `global_xgb_daily_last_month_h100_forecast_clean.py` | **6.1516%** | **5.9135%** | **34.48** | Лучшая daily |
-| Daily | Per-cluster | `global_xgb_daily_last_month_h100_forecast_per_cluster.py` | 6.3146% | 5.9787% | 39.50 | Исследовательская |
-| Daily | Hybrid | отдельного файла нет | **6.0798%** | 5.9277% | **33.84** | Потенциально лучшая daily |
-
----
-
-# 9. Сравнение подходов
-
-## 9.1. Global модели
-
-### Преимущества
-
-```text
-1. Больше обучающих данных на одну модель.
-2. Лучше устойчивость.
-3. Меньше риск переобучения на малых группах.
-4. Проще запуск и анализ.
-5. Хорошо работают на дневном и недельном масштабе.
-```
-
-### Недостатки
-
-```text
-1. Сглаживают различия между типами акций.
-2. Кластеры используются только как признаки.
-3. Могут недоучитывать особенности отдельных групп.
+global_xgb_weekly_model_short_macro.json
+global_xgb_weekly_model_long_no_macro.json
 ```
 
 ---
 
-## 9.2. Per-cluster модели
+### 15.5 `weekly_per_cluster`
 
-### Преимущества
+Назначение:
 
 ```text
-1. Более специализированные модели.
-2. Лучше учитывают поведение отдельных групп акций.
-3. Могут улучшать отдельные кластеры и тикеры.
-4. Для monthly постановки дали лучший WAPE/MAPE.
+Недельные XGBoost-модели, обученные отдельно внутри каждого кластера.
 ```
 
-### Недостатки
+Горизонты:
 
 ```text
-1. Меньше данных на каждую модель.
-2. Выше риск переобучения.
-3. Больше моделей и дольше запуск.
-4. На weekly и daily в чистом виде хуже global.
-5. Некоторые кластеры сильно портят общий результат.
+h=1..52 недели
+```
+
+Группы:
+
+```text
+short_macro:   h=1..13
+long_no_macro: h=14..52
+```
+
+Основные файлы метрик:
+
+```text
+fixed_origin_weekly_predictions.csv
+fixed_origin_weekly_metrics_overall.json
+fixed_origin_weekly_metrics_by_horizon.csv
+fixed_origin_weekly_metrics_by_model_group.csv
+fixed_origin_weekly_metrics_by_date.csv
+fixed_origin_weekly_metrics_by_ticker.csv
+fixed_origin_weekly_metrics_by_cluster.csv
+```
+
+Примеры файлов моделей:
+
+```text
+cluster_0_xgb_weekly_model_short_macro.json
+cluster_0_xgb_weekly_model_long_no_macro.json
+cluster_1_xgb_weekly_model_short_macro.json
+cluster_1_xgb_weekly_model_long_no_macro.json
 ```
 
 ---
 
-## 9.3. Hybrid схемы
+### 15.6 `monthly_global`
 
-### Преимущества
+Назначение:
 
 ```text
-1. Используют сильные стороны global и per-cluster.
-2. Могут улучшить WAPE/RMSE.
-3. Позволяют не применять кластерные модели к проблемным кластерам.
+Глобальная месячная модель XGBoost по всем тикерам.
 ```
 
-### Недостатки
+Горизонты:
 
 ```text
-1. Нужен отдельный селектор моделей.
-2. Надо выбирать правила честно по validation, а не по test.
-3. Сложнее объяснять и поддерживать.
+h=1..12 месяцев
+```
+
+Группы:
+
+```text
+short_macro:   h=1..3
+long_no_macro: h=4..12
+```
+
+Основные файлы метрик:
+
+```text
+fixed_origin_monthly_predictions.csv
+fixed_origin_monthly_metrics_overall.json
+fixed_origin_monthly_metrics_by_horizon.csv
+fixed_origin_monthly_metrics_by_model_group.csv
+fixed_origin_monthly_metrics_by_date.csv
+fixed_origin_monthly_metrics_by_ticker.csv
+```
+
+Файлы моделей:
+
+```text
+global_xgb_monthly_model_short_macro.json
+global_xgb_monthly_model_long_no_macro.json
 ```
 
 ---
 
-# 10. Главные выводы
+### 15.7 `monthly_per_cluster`
 
-## 10.1. Лучшая недельная модель
+Назначение:
 
 ```text
-global_xgb_weekly_h100_forecast_two_models.py
+Месячные XGBoost-модели, обученные отдельно внутри каждого кластера.
 ```
 
-Она лучше чистой недельной per-cluster версии и остаётся основной weekly-моделью.
+Горизонты:
+
+```text
+h=1..12 месяцев
+```
+
+Группы:
+
+```text
+short_macro:   h=1..3
+long_no_macro: h=4..12
+```
+
+Основные файлы метрик:
+
+```text
+fixed_origin_monthly_predictions.csv
+fixed_origin_monthly_metrics_overall.json
+fixed_origin_monthly_metrics_by_horizon.csv
+fixed_origin_monthly_metrics_by_model_group.csv
+fixed_origin_monthly_metrics_by_date.csv
+fixed_origin_monthly_metrics_by_ticker.csv
+fixed_origin_monthly_metrics_by_cluster.csv
+```
+
+Примеры файлов моделей:
+
+```text
+cluster_0_xgb_monthly_model_short_macro.json
+cluster_0_xgb_monthly_model_long_no_macro.json
+cluster_1_xgb_monthly_model_short_macro.json
+cluster_1_xgb_monthly_model_long_no_macro.json
+```
 
 ---
 
-## 10.2. Лучшая месячная модель
+---
+
+## 16. Python-файлы проекта и их назначение
+
+В проекте использовалось несколько групп Python-файлов. Они относятся к разным этапам работы: подготовка признаков, исходные rolling/direct эксперименты, отдельные fixed-origin эксперименты и итоговый единый runner.
+
+### 16.1 Базовые и вспомогательные файлы
+
+| Файл | Назначение |
+|---|---|
+| `season.py` | Расчёт сезонных признаков и признаков на основе рядов Фурье / FFT для временных рядов акций |
+| `clusster.py` | Кластеризация акций на основе признаков временных рядов |
+---
+
+### 16.2 Файлы rolling/direct XGBoost-экспериментов
+
+До fixed-origin постановки использовались отдельные XGBoost-скрипты, в которых качество оценивалось в rolling/direct-режиме. В этой постановке для каждого горизонта признаки формируются на дату:
 
 ```text
-global_xgb_monthly_h100_forecast_per_cluster.py
+feature_date = target_date - h
 ```
 
-Месячная per-cluster версия лучше месячной global по WAPE/MAPE.
+Эти скрипты нужны для оценки качества регулярно обновляемого прогноза.
+
+| Файл | Частота | Тип модели | Назначение |
+|---|---|---|---|
+| `global_xgb_daily_last_month_h100_forecast_clean.py` | Daily | Global | Глобальная дневная XGBoost-модель |
+| `global_xgb_daily_last_month_h100_forecast_per_cluster.py` | Daily | Per-cluster | Дневные XGBoost-модели отдельно по кластерам |
+| `global_xgb_weekly_h100_forecast_two_models.py` | Weekly | Global | Глобальная недельная XGBoost-модель |
+| `global_xgb_weekly_h100_forecast_per_cluster.py` | Weekly | Per-cluster | Недельные XGBoost-модели отдельно по кластерам |
+| `global_xgb_monthly_h100_forecast_two_models.py` | Monthly | Global | Глобальная месячная XGBoost-модель |
+| `global_xgb_monthly_h100_forecast_per_cluster.py` | Monthly | Per-cluster | Месячные XGBoost-модели отдельно по кластерам |
+
+Именно по этим файлам получены rolling/direct результаты, которые используются для сравнения с fixed-origin постановкой:
+
+```text
+daily_global:          WAPE 6.15%
+daily_per_cluster:     WAPE 6.31%
+weekly_global:         WAPE 17.32%
+weekly_per_cluster:    WAPE 17.90%
+monthly_global:        WAPE 19.47%
+monthly_per_cluster:   WAPE 19.19%
+```
+
+### 16.3 Итоговый единый fixed-origin runner
+
+Финальный файл:
+
+```text
+run_xgb_fixed_origin_old_features_single_full_data_patched_macro_age_v2.py
+```
+
+Это единый runner, который последовательно запускает все шесть fixed-origin моделей:
+
+```text
+daily_global
+daily_per_cluster
+weekly_global
+weekly_per_cluster
+monthly_global
+monthly_per_cluster
+```
+
+## 17. Запуск fixed-origin эксперимента
+
+Для воспроизведения fixed-origin эксперимента используется единый исполняемый файл:
+
+```text
+run_xgb_fixed_origin_old_features_single_full_data_patched_macro_age_v2.py
+```
+
+Пример запуска:
+
+```bash
+python3 run_xgb_fixed_origin_old_features_single_full_data_patched_macro_age_v2.py \
+  --out-root results_xgb_old_features_fixed_origin \
+  --prices-csv data/prices_all.csv \
+  --future-prices-csv data/prices_all_2025_12_20_today.csv \
+  --eval-end-date 2026-05-08 \
+  --macro-known-until 2025-12-20 \
+  --macro-dir data \
+  --cluster-csv cluster_fullstart_assignments.csv \
+  --season-dir results_stocks/prices_all \
+  --price-col Close \
+  --n-trials 300 \
+  --n-jobs 8 \
+  --numba-threads 8 \
+  --use-gpu 1 \
+  --gpu-id 0 \
+  2>&1 | tee run_xgb_fixed_origin_old_features_$(date +%Y%m%d_%H%M%S).log
+```
 
 ---
 
-## 10.3. Лучшая дневная модель
+## 18. Resume после остановки
+
+Каждый шаг после успешного завершения создаёт marker-файл:
 
 ```text
-global_xgb_daily_last_month_h100_forecast_clean.py
+run_dir/_status/<step>.done
 ```
 
-Она лучше дневной per-cluster версии по всем основным метрикам.
+Если выполнение остановилось на некоторой модели, повторный запуск с тем же `--run-dir` пропускает уже завершённые шаги и продолжает с первого незавершённого.
+
+Пример:
+
+```bash
+python3 run_xgb_fixed_origin_old_features_single_full_data_patched_macro_age_v2.py \
+  --run-dir results_xgb_old_features_fixed_origin/run_YYYYMMDD_HHMMSS \
+  --prices-csv data/prices_all.csv \
+  --future-prices-csv data/prices_all_2025_12_20_today.csv \
+  --eval-end-date 2026-05-08 \
+  --macro-known-until 2025-12-20 \
+  --macro-dir data \
+  --cluster-csv cluster_fullstart_assignments.csv \
+  --season-dir results_stocks/prices_all \
+  --price-col Close \
+  --n-trials 300 \
+  --n-jobs 8 \
+  --numba-threads 8 \
+  --use-gpu 1 \
+  --gpu-id 0 \
+  2>&1 | tee resume_xgb_fixed_origin_old_features_$(date +%Y%m%d_%H%M%S).log
+```
+
+Можно явно выбрать стартовый шаг:
+
+```bash
+--start-from weekly_per_cluster
+```
+
+Можно запустить только часть моделей:
+
+```bash
+--only monthly_global,monthly_per_cluster
+```
 
 ---
 
-## 10.4. Лучшие потенциальные модели
+## 19. Оптимизация памяти
 
-Для weekly и daily лучшие результаты даёт гибридный подход, но для него пока нет отдельного финального `.py` файла:
+Пайплайн построен так, чтобы не держать все модели и все панели признаков в памяти одновременно.
+
+Основные элементы оптимизации:
 
 ```text
-weekly hybrid:
-    per-cluster для хороших кластеров
-    fallback для проблемного кластера 4
-
-daily hybrid:
-    clusters 0,2,3 -> per-cluster
-    clusters 1,4,5,6 -> global
+1. Модели выполняются строго последовательно.
+2. Каждый шаг запускается отдельным Python-процессом.
+3. После завершения процесса память освобождается операционной системой.
+4. Daily, weekly и monthly модели не находятся в памяти одновременно.
+5. Global и per-cluster модели не находятся в памяти одновременно.
+6. Resume не запускает заново уже готовые шаги.
+7. joblib и numba используются для ускорения CPU-части.
+8. XGBoost использует GPU при use_gpu=1.
 ```
 
+По умолчанию используется полный объём обучающих данных:
+
+```text
+--max-optuna-rows 0
+--max-train-rows 0
+```
+
+Значение `0` означает:
+
+```text
+без ограничения строк
+```
 
 ---
 
-## 11. Следующий шаг
+## 20. Итоговая интерпретация
 
-Сделать две финальные гибридные версии:
+В эксперименте рассмотрены две постановки оценки качества прогнозных моделей:
 
 ```text
-global_xgb_weekly_h100_forecast_hybrid_by_cluster.py
-global_xgb_daily_last_month_h100_forecast_hybrid_by_cluster.py
+rolling/direct forecast
+fixed-origin forecast
 ```
 
-Они должны выбирать модель по кластеру на основании validation-качества, а не test-результатов.
+Rolling/direct постановка показывает качество обновляемого прогноза. Fixed-origin постановка показывает качество прогноза всего будущего периода из одной начальной точки.
+
+В fixed-origin постановке итоговые результаты составляют:
+
+```text
+daily_global:          WAPE ≈ 7.43%
+weekly_global:         WAPE ≈ 19.36%
+monthly_per_cluster:   WAPE ≈ 21.83%
+```
+
+Сравнение global и per-cluster моделей показывает, что кластеризация полезна преимущественно на коротких горизонтах. На длинных горизонтах global-модель оказывается устойчивее.
+
+Наиболее перспективным вариантом по итогам сравнения является гибридная схема:
+
+```text
+short horizon -> per-cluster
+long horizon  -> global
+```
+
+Она даёт лучшие значения WAPE:
+
+```text
+daily hybrid:   7.30%
+weekly hybrid:  19.31%
+monthly hybrid: 21.22%
+```
 
 ---
 
-# 12. Краткое резюме
+## 21. Выводы
 
-```text
-1. Недельная global-модель — лучшая  модель для прогноза на год по неделям.
-2. Месячная per-cluster модель — лучшая месячная модель.
-3. Дневная global модель — лучшая дневная модель на последний месяц.
-4. Per-cluster подход полезен, но не всегда лучше global.
-5. Самое перспективное развитие — hybrid by cluster.
-```
+1. Rolling/direct и fixed-origin постановки измеряют разные сценарии использования модели.
+2. Rolling/direct даёт более низкую ошибку, так как прогноз регулярно обновляется.
+3. Fixed-origin является более строгой постановкой для долгосрочного прогноза из одной даты.
+4. Global-модели устойчивее на длинных горизонтах.
+5. Per-cluster модели эффективнее на коротких горизонтах.
+6. Гибридная схема `short -> per-cluster`, `long -> global` показывает лучшие результаты.
+7. Наиболее проблемными являются `cluster_3` и `cluster_4`.
+8. Для дальнейшего улучшения качества следует отдельно исследовать волатильные тикеры и проблемные кластеры.
+
+---
+
+

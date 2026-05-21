@@ -1,47 +1,5 @@
 from __future__ import annotations
 
-"""
-global_xgb_monthly_h100_forecast.py
-
-Недельный глобальный прогноз акций через XGBoost + Optuna под H100.
-
-Постановка:
-- Есть старый файл цен до 2025-12-20: data/prices_all.csv.
-- Есть новый файл фактических цен после 2025-12-20 до 2026-05-08:
-  data/prices_all_2025_12_20_today.csv.
-- Прогнозируем по неделям весь последний год до 2026-05-08 включительно.
-- Основная проверка качества — target_month в интервале:
-  eval_start = eval_end_date - eval_years years,
-  eval_end   = eval_end_date.
-- Макропоказатели считаются неизвестными после macro_known_until.
-  По умолчанию macro_known_until=2025-12-20.
-  Для недель после этой даты макро не заглядывает в будущее:
-  используется последнее известное/опубликованное значение + признак возраста макро.
-- Цена акции и объём торгов используются как признаки.
-- Target:
-  target_logret_m{h} = log(price[t+h months]) - log(price[t]), h=1..12.
-- Метрики считаются по цене:
-  WAPE, MAPE, MSE, MAE, RMSE.
-
-Пример запуска:
-
-python3 global_xgb_monthly_h100_forecast.py \
-  --prices-csv data/prices_all.csv \
-  --future-prices-csv data/prices_all_2025_12_20_today.csv \
-  --eval-end-date 2026-05-08 \
-  --eval-years 1 \
-  --macro-known-until 2025-12-20 \
-  --macro-dir data \
-  --cluster-csv cluster_fullstart_assignments.csv \
-  --season-dir results_stocks/prices_all \
-  --out-root results_xgb_monthly_h100 \
-  --forecast-horizon-months 12 \
-  --n-trials 300 \
-  --n-jobs 16 \
-  --numba-threads 16 \
-  --use-gpu 1 \
-  --gpu-id 0
-"""
 
 import os
 
@@ -73,9 +31,6 @@ import xgboost as xgb
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
 
 MACRO_FILES = {
     "CPIAUCSL.csv": "cpi",
@@ -103,9 +58,6 @@ MACRO_LAGS_M = [1, 2, 3, 6, 12, 24]
 MACRO_ROLLS_M = [3, 6, 12, 24]
 
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 @dataclass
 class Config:
@@ -120,7 +72,6 @@ class Config:
     eval_end_date: str = "2026-05-08"
     eval_years: int = 1
 
-    # Критично: макро после этой даты считаются неизвестными.
     macro_known_until: str = "2025-12-20"
 
     date_col: str = "date"
@@ -129,9 +80,6 @@ class Config:
 
     month_rule: str = "M"
     forecast_horizon_months: int = 12
-
-    # Горизонты 1..short_horizon_months используют макро.
-    # Горизонты short_horizon_months+1..forecast_horizon_months обучаются без макро-признаков.
     short_horizon_months: int = 3
 
     val_months: int = 12
@@ -161,9 +109,6 @@ class Config:
     macro_publication_lag_days_daily: int = 1
 
 
-# ============================================================
-# NUMBA HELPERS
-# ============================================================
 
 @njit(cache=True)
 def atr_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int) -> np.ndarray:
@@ -288,9 +233,6 @@ def rolling_corr_beta_numba(x: np.ndarray, y: np.ndarray, window: int) -> Tuple[
     return corr, beta
 
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
 
 def run_id() -> str:
     return time.strftime("run_%Y%m%d_%H%M%S")
@@ -401,18 +343,8 @@ def load_prices(cfg: Config) -> Tuple[pd.DataFrame, str]:
     return df.reset_index(drop=True), price_col
 
 
-# ============================================================
-# DAILY -> MONTHLY
-# ============================================================
 
 def make_monthly_prices(raw: pd.DataFrame, price_col: str, cfg: Config) -> pd.DataFrame:
-    """
-    Агрегация дневных OHLCV в месячные строки.
-
-    Важно: month_date — это последняя фактическая торговая дата месяца,
-    а не календарный конец месяца. Поэтому неполный май 2026 будет иметь
-    month_date=2026-05-08, если данные заканчиваются этой датой.
-    """
     rows = []
 
     for ticker, sub in raw.groupby("Ticker", sort=False):
@@ -489,9 +421,6 @@ def make_monthly_prices(raw: pd.DataFrame, price_col: str, cfg: Config) -> pd.Da
 
     return monthly
 
-# ============================================================
-# MACRO FEATURES
-# ============================================================
 
 def read_macro_csv(path: Path, name: str) -> pd.Series:
     df = pd.read_csv(path)
@@ -560,7 +489,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
 
         s_raw = read_macro_csv(path, name)
 
-        # Критично: будущие макро после macro_known_until удаляем.
         s_raw = s_raw[s_raw.index <= macro_known_until].copy()
 
         if s_raw.empty:
@@ -569,7 +497,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
         monthly = is_monthly(s_raw, name)
         lag_days = cfg.macro_publication_lag_days_monthly if monthly else cfg.macro_publication_lag_days_daily
 
-        # publication/availability date.
         avail_index = s_raw.index + pd.offsets.BDay(lag_days)
 
         avail_df = pd.DataFrame({
@@ -578,7 +505,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
             name: s_raw.values,
         }).sort_values("available_date")
 
-        # Если несколько значений стали доступны в одну дату — берём последнее.
         avail_df = avail_df.drop_duplicates("available_date", keep="last")
 
         tmp = avail_df.set_index("available_date")
@@ -589,12 +515,10 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
 
         base[name] = value_aligned.astype(float)
 
-        # Возраст макро: сколько дней прошло с последней доступной публикации/наблюдения.
         base[f"{name}_age_available_days"] = (pd.Series(month_dates, index=month_dates) - pd.to_datetime(avail_aligned)).dt.days.astype(float)
         base[f"{name}_age_observation_days"] = (pd.Series(month_dates, index=month_dates) - pd.to_datetime(obs_aligned)).dt.days.astype(float)
 
-        # Флаг: значение уже заморожено из-за отсутствия макро после macro_known_until.
-        # Для недель после macro_known_until полезно показать модели, что макро устаревает.
+
         base[f"{name}_after_macro_known_until"] = (month_dates > macro_known_until).astype(np.float32)
 
         loaded.append((fname, name, "monthly" if monthly else "daily", lag_days, str(s_raw.index.max().date())))
@@ -614,7 +538,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
         s = base[col].astype(float)
         f[col] = s
 
-        # Age/freeze признаки.
         for age_col in [
             f"{col}_age_available_days",
             f"{col}_age_observation_days",
@@ -638,7 +561,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
             f[f"{col}_roll_std_{W}m"] = sd
             f[f"{col}_zscore_{W}m"] = (s - m) / sd.replace(0, np.nan)
 
-    # Derived macro.
     if {"dgs10", "dgs2"}.issubset(f.columns):
         f["yield_spread_10y_2y"] = f["dgs10"] - f["dgs2"]
         f["yield_curve_inverted_flag"] = (f["yield_spread_10y_2y"] < 0).astype(np.float32)
@@ -695,9 +617,6 @@ def make_macro_features(cfg: Config, month_dates: pd.DatetimeIndex) -> pd.DataFr
     )
 
 
-# ============================================================
-# CLUSTER / SEASON
-# ============================================================
 
 def load_cluster_features(path: Optional[str]) -> pd.DataFrame:
     if not path or not Path(path).exists():
@@ -853,9 +772,6 @@ def load_season_features(season_dir: Optional[str]) -> pd.DataFrame:
     return out
 
 
-# ============================================================
-# MONTHLY STOCK FEATURES
-# ============================================================
 
 def make_one_ticker_monthly_features(
     ticker: str,
@@ -872,17 +788,14 @@ def make_one_ticker_monthly_features(
     feat["log_price"] = logp
     feat["ret_m"] = ret
 
-    # Цена как признак — явно оставляем.
     feat["price_feature"] = p
     feat["log_price_feature"] = logp
 
-    # Targets.
     for h in horizons:
         feat[f"target_logret_m{h}"] = logp.shift(-h) - logp
         feat[f"target_price_m{h}"] = p.shift(-h)
         feat[f"target_month_m{h}"] = sub["month_date"].shift(-h)
 
-    # Return lags.
     for L in RET_LAGS_M:
         feat[f"ret_lag{L}m"] = ret.shift(L)
 
@@ -891,7 +804,6 @@ def make_one_ticker_monthly_features(
     feat["ret_positive_lag1m"] = (ret.shift(1) > 0).astype(np.float32)
     feat["ret_negative_lag1m"] = (ret.shift(1) < 0).astype(np.float32)
 
-    # Price ratios/momentum.
     for L in PRICE_LAGS_M:
         feat[f"price_ratio_{L}m"] = p / p.shift(L)
         feat[f"price_mom_{L}m"] = logp - logp.shift(L)
@@ -908,7 +820,6 @@ def make_one_ticker_monthly_features(
         feat[f"ret_roll_kurt_{W}m"] = r.kurt()
         feat[f"ret_mom_{W}m"] = ret.rolling(W, min_periods=max(2, W // 4)).sum()
 
-        # Годовая волатильность по недельным данным.
         feat[f"realized_vol_{W}m"] = r.std() * np.sqrt(12.0)
 
         down = ret.where(ret < 0.0, 0.0)
@@ -927,7 +838,6 @@ def make_one_ticker_monthly_features(
         if f"ret_roll_std_{a}m" in feat and f"ret_roll_std_{b}m" in feat:
             feat[f"volatility_ratio_{a}_{b}m"] = feat[f"ret_roll_std_{a}m"] / feat[f"ret_roll_std_{b}m"].replace(0, np.nan)
 
-    # Monthly ATR/RSI.
     high_arr = sub["month_high"].to_numpy(np.float64)
     low_arr = sub["month_low"].to_numpy(np.float64)
     close_arr = sub["month_close"].to_numpy(np.float64)
@@ -945,7 +855,6 @@ def make_one_ticker_monthly_features(
     feat["rsi_overbought_flag"] = (pd.Series(feat["rsi_12m"]) > 70).astype(np.float32)
     feat["rsi_oversold_flag"] = (pd.Series(feat["rsi_12m"]) < 30).astype(np.float32)
 
-    # Moving averages.
     for W in [3, 6, 12, 24, 36]:
         sma = p.rolling(W, min_periods=max(2, W // 4)).mean()
         ema = p.ewm(span=W, adjust=False).mean()
@@ -975,7 +884,6 @@ def make_one_ticker_monthly_features(
     feat["bollinger_width_6m"] = (upper - lower) / mid.replace(0, np.nan)
     feat["bollinger_position_6m"] = (p - lower) / (upper - lower).replace(0, np.nan)
 
-    # Volume.
     vol = sub["month_volume"].astype(float)
     logv = np.log(vol.replace(0, np.nan))
 
@@ -997,7 +905,6 @@ def make_one_ticker_monthly_features(
     for W in [6, 12, 24]:
         feat[f"ret_volume_corr_{W}m"] = ret.rolling(W, min_periods=max(3, W // 4)).corr(feat["vol_dln_1m"])
 
-    # Calendar.
     dt = pd.to_datetime(sub["month_date"])
 
     feat["month_of_year"] = dt.dt.month
@@ -1045,9 +952,6 @@ def make_monthly_stock_features(monthly: pd.DataFrame, cfg: Config) -> pd.DataFr
     return out
 
 
-# ============================================================
-# PANEL-LEVEL FEATURES
-# ============================================================
 
 def add_market_features(panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     print("[FEATURES] monthly market")
@@ -1324,8 +1228,6 @@ def build_panel(
     drop.update([f"target_price_m{h}" for h in range(1, cfg.forecast_horizon_months + 1)])
     drop.update([f"target_month_m{h}" for h in range(1, cfg.forecast_horizon_months + 1)])
 
-    # В отличие от дневной версии цену специально оставляем:
-    # price_feature, log_price_feature, month_price, daily_price_* попадают в модель.
     feats = []
 
     for c in panel.columns:
@@ -1344,18 +1246,7 @@ def build_panel(
 
 
 
-# ============================================================
-# FEATURE SET SPLIT: SHORT WITH MACRO / LONG WITHOUT MACRO
-# ============================================================
-
 def is_macro_feature(col: str) -> bool:
-    """
-    Возвращает True для признаков, которые происходят из макро-файлов
-    или являются производными макро/макро-взаимодействиями.
-
-    Эти признаки используются только в short-horizon модели.
-    Для long-horizon модели они исключаются уже на этапе Optuna и обучения.
-    """
     macro_roots = {
         "cpi",
         "brent",
@@ -1398,11 +1289,6 @@ def is_macro_feature(col: str) -> bool:
 
 
 def split_feature_sets(feat_cols: List[str], out_dir: Path) -> Tuple[List[str], List[str], List[str]]:
-    """
-    short_features: все признаки, включая макро.
-    long_features: все признаки, кроме макро и производных макро.
-    macro_features: исключённые макро-признаки.
-    """
     macro_features = [c for c in feat_cols if is_macro_feature(c)]
     long_features = [c for c in feat_cols if not is_macro_feature(c)]
     short_features = list(feat_cols)
@@ -1431,10 +1317,6 @@ def horizon_groups(cfg: Config) -> Tuple[List[int], List[int]]:
     long_h = list(range(min(cfg.short_horizon_months, cfg.forecast_horizon_months) + 1, cfg.forecast_horizon_months + 1))
     return short_h, long_h
 
-
-# ============================================================
-# METRICS
-# ============================================================
 
 def logret_metrics(y: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     return {
@@ -1476,10 +1358,6 @@ def price_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
         "n": int(len(y_true)),
     }
 
-
-# ============================================================
-# STACKING
-# ============================================================
 
 def stack_horizons(
     df: pd.DataFrame,
@@ -1561,9 +1439,6 @@ def stack_horizons(
     return X, y, M
 
 
-# ============================================================
-# XGBOOST / OPTUNA
-# ============================================================
 
 def fixed_params(raw: Dict[str, Any], attrs: Dict[str, Any], cfg: Config) -> Tuple[Dict[str, Any], int]:
     params = {
@@ -1782,10 +1657,6 @@ def train_final(
 
     return bst
 
-
-# ============================================================
-# VALIDATION / BACKTEST / FORECAST
-# ============================================================
 
 def validate(
     bst_short: xgb.Booster,
@@ -2091,9 +1962,6 @@ def forecast_future(
 
     return out
 
-# ============================================================
-# CLI / MAIN
-# ============================================================
 
 def parse_args() -> Config:
     ap = argparse.ArgumentParser("Global XGBoost monthly stock forecast optimized for H100")
@@ -2195,7 +2063,6 @@ def main() -> None:
     eval_end = pd.Timestamp(cfg.eval_end_date)
     eval_start = eval_end - pd.DateOffset(years=int(cfg.eval_years))
 
-    # В Optuna validation берём год перед test year.
     valid_target_to = eval_start - pd.offsets.MonthEnd(1)
     valid_target_from = valid_target_to - pd.DateOffset(months=int(cfg.val_months))
 

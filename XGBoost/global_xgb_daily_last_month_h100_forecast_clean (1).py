@@ -1,46 +1,8 @@
 from __future__ import annotations
 
-"""
-global_xgb_daily_h100_forecast_last_month_two_models.py
-
-Clean daily XGBoost-модель для прогноза последнего месяца по дням. Версия с облегчёнными market/cluster/macro-interaction признаками для устойчивости по RAM.
-
-Текущая постановка:
-- История до 2025-12-20 лежит в основном файле prices_all.csv.
-- Факт после 2025-12-20 лежит в отдельном файле prices_all_2025_12_20_today.csv.
-- Файл после 2025-12-20 используется для построения полного panel и для проверки факта.
-- Последний месяц до 2026-05-08 включительно используется только для расчёта метрик:
-  WAPE, MAPE, MSE, MAE, RMSE.
-- Модель обучается только на данных до начала тестового окна с запасом forecast_horizon,
-  чтобы target_h не залезал в период оценки.
-- Прогноз direct multi-horizon:
-  target_h = log(price[t+h]) - log(price[t]), h = 1..21.
-- XGBoost использует GPU/H100 через device=cuda и tree_method=hist.
-- Optuna подбирает параметры.
-- CPU-часть частично распараллелена через joblib и numba.
-
-Пример запуска:
-
-python3 global_xgb_daily_h100_forecast_last_month_two_models.py \
-  --prices-csv data/prices_all.csv \
-  --future-prices-csv data/prices_all_2025_12_20_today.csv \
-  --eval-end-date 2026-05-08 \
-  --eval-months 1 \
-  --macro-dir data \
-  --cluster-csv cluster_fullstart_assignments.csv \
-  --season-dir results_stocks/prices_all \
-  --out-root results_xgb_daily_h100 \
-  --forecast-horizon 21 \
-  --n-trials 300 \
-  --n-jobs 16 \
-  --numba-threads 16 \
-  --use-gpu 1 \
-  --gpu-id 0
-"""
 
 import os
 
-# Важно задавать до тяжёлых импортов, чтобы не было размножения потоков.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -69,10 +31,6 @@ import xgboost as xgb
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
 MACRO_FILES = {
     "CPIAUCSL.csv": "cpi",
     "DCOILBRENTEU.csv": "brent",
@@ -98,9 +56,6 @@ MACRO_LAGS = [1, 5, 21, 63, 126, 252]
 MACRO_ROLLS = [5, 21, 63, 126, 252]
 
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 @dataclass
 class Config:
@@ -110,17 +65,12 @@ class Config:
     season_dir: Optional[str]
     out_root: str
     resume_run_dir: Optional[str] = None
-
-    # Дополнительный файл с фактическими ценами после 2025-12-20.
     future_prices_csv: Optional[str] = None
 
-    # Последние N месяцев до eval_end_date включительно — только для метрик.
     eval_end_date: str = "2026-05-08"
     eval_months: int = 1
     macro_known_until: str = "2025-12-20"
 
-    # Горизонты 1..short_horizon_days используют макро.
-    # Горизонты short_horizon_days+1..forecast_horizon обучаются без макро.
     short_horizon_days: int = 5
 
     date_col: str = "date"
@@ -154,9 +104,6 @@ class Config:
     macro_publication_lag_days_daily: int = 1
 
 
-# ============================================================
-# NUMBA HELPERS
-# ============================================================
 
 @njit(cache=True)
 def atr_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int) -> np.ndarray:
@@ -288,10 +235,6 @@ def rolling_corr_beta_numba(x: np.ndarray, y: np.ndarray, window: int) -> Tuple[
     return corr, beta
 
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
 def run_id() -> str:
     return time.strftime("run_%Y%m%d_%H%M%S")
 
@@ -414,10 +357,6 @@ def load_prices(cfg: Config) -> Tuple[pd.DataFrame, str]:
     return df, price_col
 
 
-# ============================================================
-# MACRO FEATURES
-# ============================================================
-
 def read_macro_csv(path: Path, name: str) -> pd.Series:
     df = pd.read_csv(path)
 
@@ -482,7 +421,6 @@ def make_macro_features(cfg: Config, dates: pd.DatetimeIndex) -> pd.DataFrame:
 
         s = read_macro_csv(path, name)
 
-        # Будущие макро после macro_known_until считаются неизвестными.
         macro_known_until = pd.Timestamp(cfg.macro_known_until)
         s = s[s.index <= macro_known_until].copy()
         if s.empty:
@@ -495,7 +433,6 @@ def make_macro_features(cfg: Config, dates: pd.DatetimeIndex) -> pd.DataFrame:
             else cfg.macro_publication_lag_days_daily
         )
 
-        # Сдвиг индекса — простая защита от утечки будущей публикации.
         s = s.copy()
         s.index = s.index + pd.offsets.BDay(shift)
 
@@ -538,7 +475,6 @@ def make_macro_features(cfg: Config, dates: pd.DatetimeIndex) -> pd.DataFrame:
             f[f"{col}_roll_std_{W}"] = sd
             f[f"{col}_zscore_{W}"] = (s - m) / sd.replace(0, np.nan)
 
-    # Derived macro.
     if {"dgs10", "dgs2"}.issubset(f.columns):
         f["yield_spread_10y_2y"] = f["dgs10"] - f["dgs2"]
         f["yield_curve_inverted_flag"] = (f["yield_spread_10y_2y"] < 0).astype(np.float32)
@@ -595,9 +531,6 @@ def make_macro_features(cfg: Config, dates: pd.DatetimeIndex) -> pd.DataFrame:
     )
 
 
-# ============================================================
-# CLUSTER / SEASON FEATURES
-# ============================================================
 
 def load_cluster_features(path: Optional[str]) -> pd.DataFrame:
     if not path or not Path(path).exists():
@@ -761,9 +694,6 @@ def load_season_features(season_dir: Optional[str]) -> pd.DataFrame:
     return out
 
 
-# ============================================================
-# STOCK FEATURES
-# ============================================================
 
 def make_one_ticker_features(
     ticker: str,
@@ -800,8 +730,7 @@ def make_one_ticker_features(
         pd.to_numeric(sub["Volume"], errors="coerce").astype(float).reset_index(drop=True)
         if "Volume" in sub.columns else pd.Series(np.nan, index=p.index)
     )
-
-    # Чтобы не фрагментировать DataFrame, основные признаки копим в словарь.
+  
     data: Dict[str, Any] = {
         "date": date,
         "Ticker": ticker,
@@ -1005,19 +934,7 @@ def make_stock_features(
     cfg: Config,
     out_dir: Path,
 ) -> pd.DataFrame:
-    """
-    Streaming/batched версия построения дневных признаков.
-
-    Старая версия делала так:
-        parts = Parallel(...)(... все тикеры ...)
-        panel = pd.concat(parts)
-
-    Для дневных данных это даёт огромный пик RAM: одновременно живут
-    все датафреймы по тикерам + итоговый concat.
-
-    Здесь признаки считаются батчами, каждый батч сразу сохраняется в parquet,
-    затем батчи перечитываются уже с оптимизированными dtype.
-    """
+  
     horizons = list(range(1, cfg.forecast_horizon + 1))
     groups = list(raw.groupby("Ticker", sort=False))
 
@@ -1026,7 +943,6 @@ def make_stock_features(
     tmp_dir = out_dir / "_daily_ticker_feature_batches"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Чистим старые батчи, если такой run_dir переиспользуется.
     for old in tmp_dir.glob("features_batch_*.parquet"):
         old.unlink()
 
@@ -1040,7 +956,6 @@ def make_stock_features(
             f"tickers={start_i + 1}..{start_i + len(batch)}"
         )
 
-        # Для дневной версии используем threading, чтобы не плодить копии raw/sub в процессах.
         parts = Parallel(
             n_jobs=cfg.n_jobs,
             backend="threading",
@@ -1085,17 +1000,8 @@ def make_stock_features(
     return out
 
 
-# ============================================================
-# PANEL-LEVEL FEATURES
-# ============================================================
 
 def add_market_features(panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """
-    Облегчённая daily-версия market features.
-    В старой daily-версии здесь считались rolling beta/correlation через joblib по всем тикерам,
-    что создавало большой пик RAM. Для последнего месячного backtest оставляем устойчивые
-    рыночные лаги/rolling-признаки и excess return, без тяжёлых beta-фичей.
-    """
     print("[FEATURES] market lightweight")
 
     mkt = panel.groupby("date")["ret"].mean().sort_index().rename("mkt_ret").to_frame()
@@ -1119,10 +1025,7 @@ def add_market_features(panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return panel
 
 def add_cluster_dynamics(panel: pd.DataFrame) -> pd.DataFrame:
-    """
-    Облегчённая cluster dynamics для daily: только агрегаты текущего дня по кластеру.
-    Rolling cluster-признаки на дневной full-panel сильно увеличивают память.
-    """
+
     if "cluster_id" not in panel.columns:
         return panel
 
@@ -1159,11 +1062,7 @@ def add_rank_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_macro_interactions(panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """
-    Облегчённые macro interactions: только простые произведения текущей доходности
-    на уже известные macro-change признаки. Без rolling corr/beta по тикерам,
-    чтобы не раздувать RAM на дневной версии.
-    """
+
     print("[FEATURES] macro interactions lightweight")
 
     pairs = [
@@ -1283,10 +1182,6 @@ def build_panel(
     return panel, feats, mappings
 
 
-# ============================================================
-# METRICS
-# ============================================================
-
 def metrics(y: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     return {
         "RMSE": float(np.sqrt(mean_squared_error(y, p))),
@@ -1330,9 +1225,6 @@ def price_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     }
 
 
-# ============================================================
-# DATA STACKING
-# ============================================================
 
 def stack_horizons(
     df: pd.DataFrame,
@@ -1402,11 +1294,6 @@ def stack_horizons(
     return X, y, M
 
 
-
-# ============================================================
-# FEATURE SET SPLIT: SHORT WITH MACRO / LONG WITHOUT MACRO
-# ============================================================
-
 def is_macro_feature(col: str) -> bool:
     macro_roots = {
         "cpi", "brent", "usd_eur", "dgs2", "dgs10", "dgs30", "effr", "m2", "unrate",
@@ -1449,10 +1336,6 @@ def horizon_groups(cfg: Config) -> Tuple[List[int], List[int]]:
     long_h = list(range(min(cfg.short_horizon_days, cfg.forecast_horizon) + 1, cfg.forecast_horizon + 1))
     return short_h, long_h
 
-# ============================================================
-# XGBOOST / OPTUNA
-# ============================================================
-
 
 
 def make_final_train_matrix(
@@ -1461,15 +1344,6 @@ def make_final_train_matrix(
     best_params: Dict[str, Any],
     cfg: Config,
 ) -> Any:
-    """
-    Компактная матрица только для финального обучения.
-
-    Логика обучения не меняется:
-    - те же X;
-    - тот же y;
-    - тот же max_bin из best_params;
-    - тот же tree_method=hist.
-    """
     if cfg.use_gpu:
         try:
             return xgb.QuantileDMatrix(
@@ -1496,15 +1370,7 @@ def make_xgb_matrix(
     cfg: Config,
     ref: Optional[Any] = None,
 ) -> Any:
-    """
-    Создаёт матрицу XGBoost в более компактном формате.
 
-    Важно:
-    - строки не сэмплируются;
-    - признаки не удаляются;
-    - target не меняется;
-    - меняется только внутреннее представление данных для XGBoost.
-    """
     if cfg.use_gpu:
         try:
             return xgb.QuantileDMatrix(
@@ -1725,10 +1591,6 @@ def train_final(
     return bst
 
 
-# ============================================================
-# VALIDATION / BACKTEST / FORECAST
-# ============================================================
-
 def validate(
     bst_short: xgb.Booster,
     bst_long: Optional[xgb.Booster],
@@ -1913,9 +1775,6 @@ def split_dates(panel: pd.DataFrame, cfg: Config) -> pd.Timestamp:
     return pd.Timestamp(dates[-cfg.val_days])
 
 
-# ============================================================
-# CLI / MAIN
-# ============================================================
 
 def parse_args() -> Config:
     ap = argparse.ArgumentParser("Global XGBoost daily stock forecast optimized for H100")
@@ -2039,9 +1898,6 @@ def main() -> None:
     eval_end = pd.Timestamp(cfg.eval_end_date)
     eval_start = eval_end - pd.DateOffset(months=int(cfg.eval_months))
 
-    # Важно:
-    # train_target_cutoff сдвинут назад на forecast_horizon,
-    # чтобы target_h21 из train не попадал в тестовое окно.
     train_target_cutoff = eval_start - pd.offsets.BDay(cfg.forecast_horizon)
 
     historical = panel[(panel["date"] < train_target_cutoff) & has_target].copy()
@@ -2067,7 +1923,6 @@ def main() -> None:
     print(f"[MODEL SPLIT] short horizons with macro: {short_horizons[0]}..{short_horizons[-1] if short_horizons else 'none'}")
     print(f"[MODEL SPLIT] long horizons without macro: {long_horizons[0] if long_horizons else 'none'}..{long_horizons[-1] if long_horizons else 'none'}")
 
-    # Финальная модель обучается только на историческом периоде до тестового окна.
     final_train = historical
 
     short_model_path = out_dir / "global_xgb_daily_model_short_macro.json"
@@ -2090,10 +1945,8 @@ def main() -> None:
             best_long = run_optuna(train, valid, long_feat_cols, cfg, out_dir, long_horizons, "long_no_macro")
             bst_long = train_final(final_train, long_feat_cols, best_long, cfg, out_dir, long_horizons, "long_no_macro")
 
-    # Pre-test validation.
     validate(bst_short, bst_long, valid, short_feat_cols, long_feat_cols, cfg, out_dir)
 
-    # Главные метрики задачи: последний месяц до eval_end включительно.
     evaluate_last_months_backtest(bst_short, bst_long, panel, short_feat_cols, long_feat_cols, cfg, out_dir)
 
     if cfg.save_future_forecast:
